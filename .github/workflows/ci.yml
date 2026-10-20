@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: python -m pip install uv==0.12.7
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev --extra screenshots --extra code-mode --extra apps
+
+      - name: Run Ruff
+        run: uv run ruff check src tests
+
+      - name: Run pytest
+        run: uv run pytest -q
+
+      # sap_preview must degrade to text when prefab-ui is absent, which the
+      # all-extras job above cannot prove.
+      - name: Test without apps extra
+        if: matrix.python-version == '3.12'
+        run: uv run --isolated --frozen --extra dev python -m pytest tests/test_preview.py -q
+
+      - name: Smoke test CLI help
+        if: matrix.python-version == '3.12'
+        run: uv run python -m mcp_sap_gui.server --help
+
+      - name: Build package
+        if: matrix.python-version == '3.12'
+        run: uv build

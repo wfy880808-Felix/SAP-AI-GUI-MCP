@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege by default; jobs that need more declare it themselves.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Publishing (PyPI trusted publishing, MCP registry OIDC) is bound to
+    # GitHub; skip the whole pipeline on any other forge (e.g. Forgejo mirror).
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.tag.outputs.tag_name }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install uv==0.12.7
+
+      - name: Capture tag
+        id: tag
+        run: echo "tag_name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches package version
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          expected = f"v{version}"
+          actual = os.environ["GITHUB_REF_NAME"]
+          if actual != expected:
+              raise SystemExit(f"Tag {actual!r} does not match package version {expected!r}")
+
+          server = json.loads(Path("server.json").read_text(encoding="utf-8"))
+          mismatches = [server["version"]] + [p["version"] for p in server["packages"]]
+          if any(v != version for v in mismatches):
+              raise SystemExit(f"server.json versions {mismatches!r} do not all match {version!r}")
+          print(f"Verified tag {actual} matches package and server.json versions.")
+          PY
+
+      # Outside the checkout: hatchling puts every file git does not ignore
+      # into the sdist, and dist/ is published, uploaded and checksummed.
+      - name: Extract release notes from CHANGELOG.md
+        run: >-
+          python scripts/release_notes.py "${GITHUB_REF_NAME#v}"
+          --repo "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF_NAME}"
+          --output "${RUNNER_TEMP}/release-notes/release-notes.md"
+
+      - name: Build distribution artifacts
+        run: uv build
+
+      - name: Generate CycloneDX SBOM
+        run: >-
+          uv export --frozen
+          --extra screenshots --extra code-mode --extra apps
+          --format cyclonedx1.5
+          -o dist/mcp-sap-gui-sbom.cdx.json
+
+      - name: Generate checksums
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          dist = Path("dist")
+          lines = []
+          # Skip dotfiles: uv build writes dist/.gitignore, which is not a
+          # release asset (upload-artifact leaves hidden files out).
+          for path in sorted(p for p in dist.iterdir() if not p.name.startswith(".")):
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {path.name}")
+          (dist / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-dist
+          path: dist/*
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/release-notes/release-notes.md
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Download release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-notes
+          path: notes
+
+      # The action only warns when body_path cannot be read and publishes
+      # the generated notes alone, so check the file first.
+      - name: Check release notes
+        run: test -s notes/release-notes.md
+
+      # body_path comes first, then GitHub's generated list of merged PRs.
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          body_path: notes/release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.build.outputs.tag_name, '-') }}
+          files: |
+            dist/*
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Remove non-distribution files
+        run: rm -f dist/SHA256SUMS.txt dist/*.cdx.json
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  mcp-registry:
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install mcp-publisher (pinned, digest-verified)
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          # sha256 of mcp-publisher_linux_amd64.tar.gz, cross-checked against
+          # the release's registry_1.8.1_checksums.txt on 2026-08-29.
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+        run: |
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish

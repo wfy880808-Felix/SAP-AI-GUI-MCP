@@ -1,0 +1,1429 @@
+"""
+Tables Mixin - ALV grid and GuiTableControl operations.
+
+Provides table reading, row selection, cell operations, and toolbar
+interaction for both ALV grids (GuiGridView) and classic table controls
+(GuiTableControl).
+"""
+
+import logging
+import re
+from typing import Any, Dict, List, Optional
+
+from .models import _TOOLBAR_BUTTON_TYPES, VKey
+
+logger = logging.getLogger(__name__)
+
+
+def _is_blank_cell(value: Any) -> bool:
+    """True for a table-control cell with nothing in it.
+
+    An unchecked checkbox reads False and counts as blank. Padding rows in
+    display / change mode have no cells at all, but the blank lines of SM30
+    New Entries do, unchecked checkboxes included (seen live, V_TTZZ): with
+    False as data every blank line read as an entry. A whitespace-only value
+    counts too: the empty entry of a dropdown reads as its key, a single
+    space (see _apply_combobox_selection).
+    """
+    if value is None or value is False:
+        return True
+    return isinstance(value, str) and not value.strip()
+
+
+class TablesMixin:
+    """Mixin for table/grid operations on SAP GUI screens."""
+
+    # =========================================================================
+    # Table/Grid Operations
+    # =========================================================================
+
+    # ---- GuiTableControl helpers ----
+
+    def _get_table_control_columns(self, table, with_cell_ids: bool = False) -> list:
+        """Get column metadata from a GuiTableControl's Columns collection.
+
+        Each column entry has: index, name, title, tooltip. With
+        *with_cell_ids* (schema discovery) it also carries ``cell_type`` and a
+        ``cell_id`` template such as ``wnd[0]/usr/tblX/ctxtV-FIELD[0,{row}]``,
+        where ``{row}`` is the zero-based VISIBLE row. That is what a caller
+        needs to fill cells with set_batch_fields, without guessing the
+        txt/ctxt/cmb prefix or dumping every cell through discovery.
+
+        Note: The SAP GUI Scripting API docs state that GuiTableColumn members
+        in the Columns collection "do not support properties like id or name".
+        Column names are therefore extracted from the first row's cell Name
+        property. A table without rows (an empty view in display mode) has no
+        cells, so the title is the only name available; such columns are
+        flagged ``name_is_title``.
+        """
+        columns = []
+        col_count = table.Columns.Count
+
+        # Get column names from first row's cells (safer than col.Name
+        # which is documented as unsupported on GuiTableColumn)
+        cell_names = []
+        cell_details = []
+        for i in range(col_count):
+            name = None
+            details = {}
+            try:
+                cell = table.GetCell(0, i)
+                name = getattr(cell, 'Name', None)
+                if with_cell_ids:
+                    cell_id = self._normalize_element_id(cell.Id)
+                    details = {
+                        "cell_type": cell.Type,
+                        "cell_id": re.sub(r",\d+\]$", ",{row}]", cell_id),
+                    }
+            except Exception:
+                pass
+            cell_names.append(name)
+            cell_details.append(details)
+
+        # Get column titles and tooltips from the Columns collection
+        for i in range(col_count):
+            info = {"index": i}
+            try:
+                col = table.Columns(i)
+                try:
+                    info["title"] = col.Title
+                except Exception:
+                    info["title"] = ""
+                try:
+                    info["tooltip"] = col.Tooltip
+                except Exception:
+                    info["tooltip"] = ""
+            except Exception:
+                info["title"] = ""
+                info["tooltip"] = ""
+
+            if cell_names[i]:
+                info["name"] = cell_names[i]
+                info.update(cell_details[i])
+            else:
+                info["name"] = info.get("title") or f"col_{i}"
+                info["name_is_title"] = True
+            columns.append(info)
+        return columns
+
+    _TABLE_CELL_RE = re.compile(r"\[(\d+),(\d+)\]$")
+
+    def _table_control_values(self, table_id: str) -> Optional[Dict[tuple, Any]]:
+        """{(visible_row, column): value} of a table control's cells in ONE
+        GetObjectTree call, or None (SAP GUI before 7.70 PL3).
+
+        A cell's ID ends in [column,visible_row], the indexes GetCell takes;
+        values follow _read_cell_value. Reading cell by cell costs about
+        three COM calls each instead. A checkbox is still read over COM: the
+        tree must not carry Selected (_OBJECT_TREE_UNSAFE_PROPS).
+        """
+        tree = self._object_tree(
+            self._validate_element_id(table_id),
+            ["Id", "Type", "Text", "Key"],
+            site="table",
+        )
+        if tree is None:
+            return None
+        values: Dict[tuple, Any] = {}
+        for node in tree.get("children") or []:
+            props = node.get("properties") or {}
+            match = self._TABLE_CELL_RE.search(props.get("Id", ""))
+            if not match:
+                continue
+            cell_type = props.get("Type", "")
+            if cell_type == "GuiCheckBox":
+                try:
+                    value = self._read_cell_value(
+                        self._session.findById(self._normalize_element_id(props["Id"]))
+                    )
+                except Exception:
+                    value = None  # as _read_cell_value gives for an unreadable cell
+            elif cell_type == "GuiComboBox":
+                value = props.get("Key", "")
+            else:
+                value = props.get("Text", "")
+            values[(int(match.group(2)), int(match.group(1)))] = value
+        return values
+
+    def _read_cell_value(self, cell):
+        """Read a cell value, handling different element types."""
+        try:
+            cell_type = getattr(cell, 'Type', '')
+            if cell_type == "GuiCheckBox":
+                return bool(cell.Selected)
+            elif cell_type == "GuiComboBox":
+                return getattr(cell, 'Key', cell.Text)
+            else:
+                return cell.Text
+        except Exception:
+            return None
+
+    def _scroll_table_control_to_row(self, table, abs_row: int, *,
+                                     need_visible: bool = True) -> tuple:
+        """Scroll a GuiTableControl so *abs_row* is visible.
+
+        Returns a ``(table, visible_row_offset)`` tuple.  Pass the offset
+        to ``GetCell()`` — it uses visible-row indexing (0 = first visible
+        row) — and use the returned *table* for all further access: when a
+        scroll was needed, it is a freshly re-acquired COM reference.
+        Changing ``VerticalScrollbar.Position`` triggers a server
+        round-trip that re-renders the control and invalidates existing
+        references into it.
+
+        The offset counts from the row SAP actually put at the top, which
+        the application may choose differently: live, SE16's multiple
+        selection showed row 7 on top after a scroll to 9, and an offset
+        from the requested position wrote into the wrong row.  With
+        *need_visible*, a row that is still not visible raises ValueError,
+        so a caller never sets or focuses another row's cell.
+        """
+        visible = table.VisibleRowCount
+        scrollbar = table.VerticalScrollbar
+        current_top = scrollbar.Position
+
+        if current_top <= abs_row < current_top + visible:
+            return table, abs_row - current_top  # already visible
+
+        full_id = table.Id  # capture before the reference goes stale
+        new_pos = max(scrollbar.Minimum, min(abs_row, scrollbar.Maximum))
+        scrollbar.Position = new_pos
+        table = self._session.findById(full_id)
+        top = table.VerticalScrollbar.Position
+        visible = table.VisibleRowCount
+        if need_visible and not top <= abs_row < top + visible:
+            raise ValueError(
+                f"Row {abs_row} is not visible after scrolling: the table "
+                f"shows rows {top} to {top + visible - 1}. Nothing was changed."
+            )
+        return table, abs_row - top
+
+    def _resolve_table_control_column(self, table, column) -> int:
+        """Resolve a column name/index to a numeric column index for GuiTableControl."""
+        if isinstance(column, int):
+            return column
+        if isinstance(column, str) and column.isdigit():
+            return int(column)
+
+        # Search by cell Name (from first row) and column Title
+        for i in range(table.Columns.Count):
+            # Try cell Name first
+            try:
+                cell = table.GetCell(0, i)
+                if getattr(cell, 'Name', None) == column:
+                    return i
+            except Exception:
+                pass
+            # Try column Title
+            try:
+                col = table.Columns(i)
+                if col.Title == column:
+                    return i
+            except Exception:
+                pass
+
+        raise ValueError(f"Column '{column}' not found in table")
+
+    # ---- Table reading ----
+
+    def read_table(self, table_id: str, max_rows: int = 100,
+                   columns: str = "", columns_only: bool = False,
+                   start_row: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Read data from an ALV grid or table control.
+
+        Automatically detects GuiGridView (ALV) vs GuiTableControl and
+        uses the appropriate API for each.
+
+        Args:
+            table_id: SAP GUI table/grid ID
+            max_rows: Maximum rows to read (default 100)
+            columns: Comma-separated column names to include (empty = all).
+                Reduces response size when only a few columns are needed.
+            columns_only: If True, return only column metadata with empty
+                data (schema discovery mode — very small response).
+            start_row: Row index to start reading from. For ALV: skips
+                the first N rows (None = 0). For TableControl: scrolls to
+                that row first, 0 included; None reads from the current
+                scroll position (e.g. after "Position..."). The result's
+                ``first_visible_row`` is where the read really started, and
+                ``next_start_row`` / ``has_more`` say how to read on.
+
+        Returns:
+            Dict with table data and metadata
+        """
+        self._require_session()
+
+        col_filter = []
+        if columns:
+            col_filter = [c.strip() for c in columns.split(",") if c.strip()]
+
+        try:
+            table = self._find_element(table_id)
+            if getattr(table, 'Type', '') == "GuiTableControl":
+                return self._read_table_control(
+                    table, table_id, max_rows, col_filter, columns_only, start_row,
+                )
+            return self._read_alv_grid(
+                table, table_id, max_rows, col_filter, columns_only,
+                start_row or 0,
+            )
+        except Exception as e:
+            return self._error_result(
+                {"table_id": table_id},
+                e,
+                "Could not read table",
+            )
+
+    def _read_alv_rows(self, grid, columns, start_row, end_row):
+        """Read ALV rows in [start_row, end_row), scrolling so every row renders.
+
+        GuiGridView.GetCellValue(row, col) only returns a real value when ``row``
+        is inside the grid's currently rendered scroll window; for off-screen rows
+        it returns a placeholder (the internal row handle, e.g. "0000000062").
+        We advance ``firstVisibleRow`` one visible-window at a time so each row is
+        rendered before we read it. Without this, an ALV read past the first
+        screenful silently drops or corrupts every off-screen row.
+
+        Returns ``(rows, unread_from)``: unread_from is the first row not read
+        because the grid would not scroll to it, else None. Read-only
+        scripting sets no property, so there only the rows on screen read.
+        """
+        try:
+            visible = int(grid.VisibleRowCount)
+        except Exception:
+            visible = 0
+        if visible < 1:
+            visible = 1
+
+        data = []
+        row = start_row
+        while row < end_row:
+            try:
+                grid.firstVisibleRow = row
+                window_end = min(row + visible, end_row)
+            except Exception:
+                # Rows outside the rendered window would read as row handles.
+                try:
+                    shown = int(grid.firstVisibleRow)
+                except Exception:
+                    return data, row
+                if not shown <= row < shown + visible:
+                    return data, row
+                window_end = min(shown + visible, end_row)
+            for r in range(row, window_end):
+                row_data = {}
+                for col in columns:
+                    try:
+                        row_data[col] = grid.GetCellValue(r, col)
+                    except Exception:
+                        row_data[col] = None
+                row_data["_absolute_row_index"] = r
+                data.append(row_data)
+            row = window_end
+        return data, None
+
+    def _read_alv_grid(self, grid, table_id: str, max_rows: int,
+                       col_filter: List[str] = None,
+                       columns_only: bool = False,
+                       start_row: int = 0) -> Dict[str, Any]:
+        """Read data from an ALV grid (GuiGridView)."""
+        all_columns = []
+        for i in range(grid.ColumnCount):
+            all_columns.append(grid.ColumnOrder(i))
+
+        all_column_info = []
+        for col in all_columns:
+            info = {"name": col}
+            try:
+                info["tooltip"] = grid.GetColumnTooltip(col)
+            except Exception:
+                info["tooltip"] = ""
+            try:
+                info["title"] = grid.GetDisplayedColumnTitle(col)
+            except Exception:
+                info["title"] = col
+            all_column_info.append(info)
+
+        # Apply column filter
+        if col_filter:
+            col_set = set(col_filter)
+            columns = [c for c in all_columns if c in col_set]
+            column_info = [ci for ci in all_column_info if ci["name"] in col_set]
+        else:
+            columns = all_columns
+            column_info = all_column_info
+
+        data = []
+        unread_from = None
+        start_row = max(0, start_row)
+        if not columns_only:
+            end_row = min(start_row + max_rows, grid.RowCount)
+            data, unread_from = self._read_alv_rows(grid, columns, start_row, end_row)
+
+        result = {
+            "table_id": table_id,
+            "table_type": "GuiGridView",
+            "total_rows": grid.RowCount,
+            "start_row": start_row,
+            "rows_returned": len(data),
+            "columns": columns,
+            "column_info": column_info,
+            "data": data,
+        }
+        if columns_only:
+            result["columns_only"] = True
+        if unread_from is not None:
+            result["unread_from_row"] = unread_from
+            result["note"] = (
+                f"Rows from {unread_from} on were not read: the grid would not "
+                "scroll to them (read-only scripting allows no scrolling), and "
+                "off-screen rows read as row handles, not values. Only the "
+                "rows on screen can be read here."
+            )
+        return result
+
+    @staticmethod
+    def _start_row_note(start_row: Optional[int], start_position: int,
+                        scroll_maximum: Optional[int],
+                        scroll_error: Optional[str]) -> Optional[str]:
+        """Why a table-control read did not start at the requested row."""
+        if start_row is None or start_position == start_row:
+            return None
+        if scroll_error is not None:
+            return (
+                f"start_row {start_row} was not reached: the scroll failed "
+                f"({scroll_error}), so the rows are read from row "
+                f"{start_position}. Read-only scripting allows no scrolling."
+            )
+        if scroll_maximum is not None and start_row > scroll_maximum:
+            return (
+                f"start_row {start_row} is past the scrollbar maximum "
+                f"{scroll_maximum}, so the rows are read from row "
+                f"{start_position} and can repeat rows of the previous page "
+                "(compare _absolute_row_index)."
+            )
+        return (
+            f"start_row {start_row} was not reached: the table scrolled to "
+            f"row {start_position}."
+        )
+
+    def _read_table_control(self, table, table_id: str, max_rows: int,
+                            col_filter: List[str] = None,
+                            columns_only: bool = False,
+                            start_row: Optional[int] = None) -> Dict[str, Any]:
+        """Read visible rows from a GuiTableControl.
+
+        Reads from the current scroll position without changing it (unless
+        start_row is given, 0 included).  This preserves the user's
+        navigated position (e.g. after "Position..." in SPRO/SM30) and
+        avoids crashing SAP GUI's COM server -- programmatic
+        scrollbar.Position changes can destabilize certain table views.
+
+        The read is capped at VisibleRowCount.  GuiTableControl.RowCount often
+        includes padding rows (empty rows that fill the visible area beyond
+        the actual data), so reading stops early when an all-empty row is
+        encountered.  Its absolute index is returned as ``empty_rows_from``:
+        the data ends there, whatever RowCount says (SM30: 51 vs 14 entries).
+
+        Paging: ``first_visible_row`` is where the read started,
+        ``next_start_row`` the start_row of the next page, and ``has_more``
+        whether one may exist. One read returns at most VisibleRowCount
+        rows, so ``start_row += max_rows`` skips rows. ``start_row_note``
+        explains a read that did not start at the requested row.
+        """
+        all_columns_info = self._get_table_control_columns(
+            table, with_cell_ids=columns_only,
+        )
+        all_column_names = [c["name"] for c in all_columns_info]
+        all_col_count = len(all_columns_info)
+
+        # Build column filter index mapping
+        if col_filter:
+            col_set = set(col_filter)
+            filtered_col_indices = [
+                i for i, name in enumerate(all_column_names) if name in col_set
+            ]
+            column_names = [all_column_names[i] for i in filtered_col_indices]
+            columns_info = [all_columns_info[i] for i in filtered_col_indices]
+        else:
+            filtered_col_indices = list(range(all_col_count))
+            column_names = all_column_names
+            columns_info = all_columns_info
+
+        total_rows = table.RowCount
+        visible_rows = table.VisibleRowCount
+
+        data = []
+        empty_rows_from = None
+        scroll_maximum = None
+        scroll_error = None
+        rows_to_read = 0
+        if total_rows > 0 and all_col_count > 0:
+            scrollbar = table.VerticalScrollbar
+            try:
+                scroll_maximum = int(scrollbar.Maximum)
+            except Exception:
+                scroll_maximum = None
+
+            # Scroll to start_row if one was given: 0 means the first row,
+            # not "wherever the table is" (that is start_row=None).
+            if start_row is not None:
+                new_pos = max(scrollbar.Minimum, min(start_row, scrollbar.Maximum))
+                if new_pos != scrollbar.Position:
+                    full_id = table.Id  # capture before the reference goes stale
+                    try:
+                        scrollbar.Position = new_pos
+                        # The scroll round-trip re-renders the control and
+                        # invalidates existing references — re-acquire.
+                        table = self._session.findById(full_id)
+                        scrollbar = table.VerticalScrollbar
+                    except Exception as e:
+                        # Best-effort scroll; reported in start_row_note.
+                        scroll_error = self._sanitize_error_message(
+                            e, "Could not scroll the table control",
+                        )
+            start_position = scrollbar.Position
+
+            if not columns_only:
+                values = self._table_control_values(table_id)
+
+                def cell_value(row, col):
+                    if values is not None:
+                        return values.get((row, col))
+                    try:
+                        return self._read_cell_value(table.GetCell(row, col))
+                    except Exception:
+                        return None
+
+                rows_to_read = min(visible_rows, max_rows)
+                for vis_idx in range(rows_to_read):
+                    # Padding detection must check ALL columns, not just
+                    # filtered ones — a row may have data in unfiltered
+                    # columns while filtered columns are blank.
+                    all_empty = True
+                    if col_filter:
+                        for ci in range(all_col_count):
+                            if not _is_blank_cell(cell_value(vis_idx, ci)):
+                                all_empty = False
+                                break
+                    row_data = {}
+                    for col_idx in filtered_col_indices:
+                        value = cell_value(vis_idx, col_idx)
+                        col_name = all_column_names[col_idx]
+                        row_data[col_name] = value
+                        if not col_filter and not _is_blank_cell(value):
+                            all_empty = False
+                    if all_empty:
+                        empty_rows_from = start_position + vis_idx
+                        break
+                    row_data["_absolute_row_index"] = start_position + vis_idx
+                    data.append(row_data)
+        else:
+            start_position = 0
+
+        result = {
+            "table_id": table_id,
+            "table_type": "GuiTableControl",
+            "table_field_name": getattr(table, 'TableFieldName', ''),
+            "total_rows": total_rows,
+            "first_visible_row": start_position,
+            "visible_rows": visible_rows,
+            "rows_returned": len(data),
+            "columns": column_names,
+            "column_info": columns_info,
+            "data": data,
+        }
+        if start_row is not None:
+            result["start_row"] = start_row
+        if empty_rows_from is not None:
+            result["empty_rows_from"] = empty_rows_from
+        if columns_only:
+            result["columns_only"] = True
+        else:
+            result["next_start_row"] = start_position + len(data)
+            # Not derived from total_rows: RowCount counts padding rows.
+            result["has_more"] = bool(
+                rows_to_read > 0
+                and empty_rows_from is None
+                and len(data) == rows_to_read
+                and (
+                    rows_to_read < visible_rows
+                    or scroll_maximum is None
+                    or start_position < scroll_maximum
+                )
+            )
+        start_row_note = self._start_row_note(
+            start_row, start_position, scroll_maximum, scroll_error,
+        )
+        if start_row_note:
+            result["start_row_note"] = start_row_note
+        if any(c.get("name_is_title") for c in columns_info):
+            result["note"] = (
+                "The table has no rows, so technical column names are not "
+                "available yet: the names shown are column TITLES. Read the "
+                "schema again once a row exists (e.g. after New Entries)."
+            )
+        return result
+
+    def get_alv_toolbar(self, grid_id: str) -> Dict[str, Any]:
+        """
+        Get all toolbar buttons from an ALV grid.
+
+        Args:
+            grid_id: SAP GUI grid ID
+
+        Returns:
+            Dict with list of toolbar buttons (id, text, type)
+        """
+        self._require_session()
+
+        try:
+            grid = self._find_element(grid_id)
+            button_count = grid.ToolbarButtonCount
+
+            buttons = []
+            for i in range(button_count):
+                btn_id = grid.GetToolbarButtonId(i)
+                btn_text = grid.GetToolbarButtonText(i)
+                btn_type = grid.GetToolbarButtonType(i)
+
+                btn_info = {
+                    "index": i,
+                    "id": btn_id,
+                    "text": btn_text,
+                    "type": _TOOLBAR_BUTTON_TYPES.get(btn_type, str(btn_type)),
+                }
+
+                # Add tooltip if available
+                try:
+                    btn_info["tooltip"] = grid.GetToolbarButtonTooltip(i)
+                except Exception:
+                    btn_info["tooltip"] = ""
+
+                # Add enabled state if available
+                try:
+                    btn_info["enabled"] = bool(grid.GetToolbarButtonEnabled(i))
+                except Exception:
+                    btn_info["enabled"] = True
+
+                buttons.append(btn_info)
+
+            return {
+                "grid_id": grid_id,
+                "button_count": button_count,
+                "buttons": buttons,
+            }
+        except Exception as e:
+            return self._error_result(
+                {"grid_id": grid_id},
+                e,
+                "Could not read ALV toolbar",
+            )
+
+    def press_alv_toolbar_button(self, grid_id: str, button_id: str) -> Dict[str, Any]:
+        """
+        Press a toolbar button on an ALV grid.
+
+        The button's type on the toolbar decides: Menu/ButtonAndMenu use
+        PressToolbarContextButton, which opens the menu -- use
+        select_alv_context_menu_item() to pick an item. Other buttons use
+        PressToolbarButton. Asking the type first matters: on SAP GUI 8.10
+        PressToolbarContextButton on a plain button does not fail, it runs
+        the button (&FIND opened its popup and was reported as a menu).
+
+        Args:
+            grid_id: SAP GUI grid ID
+            button_id: Toolbar button ID (from get_alv_toolbar)
+
+        Returns:
+            Dict with result status, screen info, and menu items if a menu was opened
+        """
+        self._require_session()
+
+        try:
+            grid = self._find_element(grid_id)
+
+            btn_type = self._alv_toolbar_button_type(grid, button_id)
+            if btn_type in ("Menu", "ButtonAndMenu"):
+                grid.PressToolbarContextButton(button_id)
+                menu_opened = True
+            elif btn_type is not None:
+                grid.PressToolbarButton(button_id)
+                menu_opened = False
+            else:
+                # Type unknown (ID not listed on the toolbar): try the menu
+                # press first and fall back to a regular press
+                menu_opened = False
+                try:
+                    grid.PressToolbarContextButton(button_id)
+                    menu_opened = True
+                except Exception:
+                    grid.PressToolbarButton(button_id)
+
+            if menu_opened:
+                result = {
+                    "grid_id": grid_id,
+                    "button_id": button_id,
+                    "status": "menu_opened",
+                    "hint": (
+                        "Use select_alv_context_menu_item with an item's "
+                        "function_code (select_by='id') to pick it"
+                    ),
+                }
+                items = self._open_context_menu_items(grid)
+                if items:
+                    result["menu_items"] = items
+                result["screen"] = self.get_screen_info()
+                return result
+            else:
+                return {
+                    "grid_id": grid_id,
+                    "button_id": button_id,
+                    "status": "pressed",
+                    "screen": self.get_screen_info(),
+                }
+        except Exception as e:
+            return self._error_result(
+                {"grid_id": grid_id, "button_id": button_id},
+                e,
+                "Could not press ALV toolbar button",
+            )
+
+    @staticmethod
+    def _alv_toolbar_button_type(grid, button_id: str) -> Optional[str]:
+        """Type of the toolbar button with this ID ("Button", "Menu", ...).
+
+        None when the toolbar does not list the ID or cannot be read.
+        """
+        try:
+            for i in range(grid.ToolbarButtonCount):
+                if grid.GetToolbarButtonId(i) == button_id:
+                    return _TOOLBAR_BUTTON_TYPES.get(grid.GetToolbarButtonType(i))
+        except Exception:
+            pass
+        return None
+
+    def _open_context_menu_items(self, shell, depth: int = 0) -> list:
+        """Items of the context menu open on *shell*: text and function code.
+
+        GuiShell.CurrentContextMenu (documented in the 7.60 guide, live on
+        8.10) holds the open menu; each item is a GuiContextMenu whose Name
+        is the function code. Separators (no text) are left out, submenus
+        are nested one level. [] when no menu is open.
+        """
+        try:
+            menu = shell.CurrentContextMenu if depth == 0 else shell
+            children = menu.Children
+            count = children.Count
+        except Exception:
+            return []
+        items = []
+        for i in range(count):
+            try:
+                child = children(i)
+                text = str(child.Text)
+                if not text:
+                    continue
+                item: Dict[str, Any] = {"text": text,
+                                        "function_code": str(child.Name)}
+                if depth == 0:
+                    sub = self._open_context_menu_items(child, depth + 1)
+                    if sub:
+                        item["items"] = sub
+                items.append(item)
+            except Exception:
+                continue
+        return items
+
+    def select_alv_context_menu_item(
+        self,
+        grid_id: str,
+        menu_item_id: str,
+        toolbar_button_id: Optional[str] = None,
+        select_by: str = "auto",
+    ) -> Dict[str, Any]:
+        """
+        Select an item from an ALV context menu.
+
+        If toolbar_button_id is provided, opens the context menu first and then
+        immediately selects the item -- all in a single call to avoid timing issues.
+
+        Args:
+            grid_id: SAP GUI grid ID
+            menu_item_id: Function code, visible text, or position descriptor
+            toolbar_button_id: Optional toolbar button to open the menu first
+            select_by: Selection mode:
+                - auto: if menu_item_id contains spaces, use text; otherwise try ID first
+                - id: function code selection (toolbar or regular context menu API)
+                - text: visible text selection
+                - position: position descriptor selection
+
+        Returns:
+            Dict with result status and screen info
+        """
+        self._require_session()
+
+        try:
+            grid = self._find_element(grid_id)
+            select_mode = (select_by or "auto").lower()
+
+            # Open context menu first if toolbar button specified
+            if toolbar_button_id:
+                grid.PressToolbarContextButton(toolbar_button_id)
+
+            if select_mode not in {"auto", "id", "text", "position"}:
+                raise ValueError(
+                    "Invalid select_by value. Use one of: auto, id, text, position"
+                )
+
+            def _select_by_id() -> None:
+                if toolbar_button_id:
+                    grid.SelectToolbarMenuItem(menu_item_id)
+                else:
+                    try:
+                        grid.SelectContextMenuItem(menu_item_id)
+                    except Exception:
+                        # If menu origin is unknown, try toolbar API as fallback.
+                        grid.SelectToolbarMenuItem(menu_item_id)
+
+            if select_mode == "text":
+                grid.SelectContextMenuItemByText(menu_item_id)
+            elif select_mode == "position":
+                grid.SelectContextMenuItemByPosition(menu_item_id)
+            elif select_mode == "id":
+                _select_by_id()
+            elif ' ' in menu_item_id:
+                # Auto mode: visible text tends to contain spaces.
+                grid.SelectContextMenuItemByText(menu_item_id)
+            else:
+                # Auto mode: function-code first, with text fallback.
+                try:
+                    _select_by_id()
+                except Exception:
+                    grid.SelectContextMenuItemByText(menu_item_id)
+
+            return {
+                "grid_id": grid_id,
+                "menu_item_id": menu_item_id,
+                "status": "selected",
+                "screen": self.get_screen_info(),
+            }
+        except Exception as e:
+            return self._error_result(
+                {"grid_id": grid_id, "menu_item_id": menu_item_id},
+                e,
+                "Could not select ALV context menu item",
+            )
+
+    def select_table_row(self, table_id: str, row: int) -> Dict[str, Any]:
+        """Select a row in a table/grid.
+
+        For GuiTableControl, ``row`` is an **absolute** row index.  The
+        table is scrolled if necessary to make the row visible, then
+        ``GetAbsoluteRow(row).Selected`` is set.
+
+        Per the SAP GUI Scripting API, ``GetAbsoluteRow`` uses absolute
+        indexing (independent of scroll position), unlike ``Rows()``
+        which resets after scrolling.  Confirmed via SAP GUI script
+        recording which produces ``getAbsoluteRow(N).selected = true``.
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(table_id)
+
+            if getattr(table, 'Type', '') == "GuiTableControl":
+                # Scroll is best-effort — GetAbsoluteRow uses absolute
+                # indexing and works regardless of scroll position.
+                # Some popup tables throw COM errors on scroll.
+                try:
+                    table, _ = self._scroll_table_control_to_row(
+                        table, row, need_visible=False,
+                    )
+                except Exception:
+                    pass
+                table.GetAbsoluteRow(row).Selected = True
+            else:
+                table.selectedRows = str(row)
+
+            return {
+                "table_id": table_id,
+                "selected_row": row,
+                "status": "success",
+            }
+        except Exception as e:
+            return self._error_result(
+                {"table_id": table_id},
+                e,
+                "Could not select table row",
+            )
+
+    def double_click_table_cell(self, table_id: str, row: int, column: str) -> Dict[str, Any]:
+        """Double-click a cell in a table/grid.
+
+        For GuiTableControl, ``row`` is an **absolute** row index.  The
+        table is scrolled if necessary, the row is selected via
+        ``GetAbsoluteRow``, focus is set on the target cell via
+        ``GetCell`` (visible-row indexing), and F2 is sent to the
+        owning window.
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(table_id)
+
+            if getattr(table, 'Type', '') == "GuiTableControl":
+                table, vis_row = self._scroll_table_control_to_row(table, row)
+                col_idx = self._resolve_table_control_column(table, column)
+                table.GetAbsoluteRow(row).Selected = True
+                cell = table.GetCell(vis_row, col_idx)
+                cell.SetFocus()
+                # Send F2 to the window that owns this table
+                wnd_id = table_id.split("/usr")[0]
+                self._find_window(wnd_id).sendVKey(VKey.F2)
+            else:
+                table.DoubleClick(row, column)
+
+            return {
+                "table_id": table_id,
+                "row": row,
+                "column": column,
+                "status": "double_clicked",
+                "screen": self.get_screen_info(),
+            }
+        except Exception as e:
+            return self._error_result(
+                {"table_id": table_id, "row": row, "column": column},
+                e,
+                "Could not double-click table cell",
+            )
+
+    def modify_cell(self, grid_id: str, row: int, column: str, value: str) -> Dict[str, Any]:
+        """
+        Modify the value of a cell in an ALV grid or table control.
+
+        Args:
+            grid_id: SAP GUI grid/table ID
+            row: Row index (0-based)
+            column: Column name (ALV) or column name/index (table control)
+            value: New cell value
+
+        Returns:
+            Dict with result status
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(grid_id)
+
+            if getattr(table, 'Type', '') == "GuiTableControl":
+                table, vis_row = self._scroll_table_control_to_row(table, row)
+                col_idx = self._resolve_table_control_column(table, column)
+                cell = table.GetCell(vis_row, col_idx)
+                cell.Text = value
+            else:
+                table.ModifyCell(row, column, value)
+
+            return {
+                "grid_id": grid_id,
+                "row": row,
+                "column": column,
+                "value": value,
+                "status": "success",
+            }
+        except Exception as e:
+            return self._error_result(
+                {"grid_id": grid_id, "row": row, "column": column},
+                e,
+                "Could not modify cell",
+            )
+
+    def set_current_cell(self, grid_id: str, row: int, column: str) -> Dict[str, Any]:
+        """
+        Set the current (focused) cell in an ALV grid or table control.
+
+        Args:
+            grid_id: SAP GUI grid/table ID
+            row: Row index (0-based)
+            column: Column name (ALV) or column name/index (table control)
+
+        Returns:
+            Dict with result status
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(grid_id)
+
+            if getattr(table, 'Type', '') == "GuiTableControl":
+                table, vis_row = self._scroll_table_control_to_row(table, row)
+                col_idx = self._resolve_table_control_column(table, column)
+                cell = table.GetCell(vis_row, col_idx)
+                cell.SetFocus()
+            else:
+                table.SetCurrentCell(row, column)
+
+            return {
+                "grid_id": grid_id,
+                "row": row,
+                "column": column,
+                "status": "success",
+            }
+        except Exception as e:
+            return self._error_result(
+                {"grid_id": grid_id, "row": row, "column": column},
+                e,
+                "Could not set current cell",
+            )
+
+    def get_column_info(self, grid_id: str) -> Dict[str, Any]:
+        """
+        Get detailed column information from an ALV grid or table control.
+
+        Returns column names, displayed titles, tooltips for each column.
+
+        Args:
+            grid_id: SAP GUI grid/table ID
+
+        Returns:
+            Dict with column details
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(grid_id)
+
+            if getattr(table, 'Type', '') == "GuiTableControl":
+                columns = self._get_table_control_columns(table, with_cell_ids=True)
+                return {
+                    "grid_id": grid_id,
+                    "table_type": "GuiTableControl",
+                    "column_count": len(columns),
+                    "columns": columns,
+                }
+
+            # ALV grid
+            columns = []
+            for i in range(table.ColumnCount):
+                col_name = table.ColumnOrder(i)
+                col_info = {"name": col_name, "index": i}
+
+                try:
+                    col_info["title"] = table.GetDisplayedColumnTitle(col_name)
+                except Exception:
+                    col_info["title"] = col_name
+
+                try:
+                    col_info["tooltip"] = table.GetColumnTooltip(col_name)
+                except Exception:
+                    col_info["tooltip"] = ""
+
+                # XML-schema style type (string, date, decimal,
+                # nonNegativeInteger, ...) and the key-column flag.
+                try:
+                    col_info["data_type"] = table.GetColumnDataType(col_name)
+                except Exception:
+                    pass
+                try:
+                    col_info["key"] = bool(table.IsColumnKey(col_name))
+                except Exception:
+                    pass
+
+                columns.append(col_info)
+
+            return {
+                "grid_id": grid_id,
+                "column_count": len(columns),
+                "columns": columns,
+            }
+        except Exception as e:
+            return self._error_result(
+                {"grid_id": grid_id},
+                e,
+                "Could not read column information",
+            )
+
+    # ---- TableControl-specific operations ----
+
+    def scroll_table_control(self, table_id: str, position: int) -> Dict[str, Any]:
+        """
+        Scroll a GuiTableControl to a specific row position.
+
+        The application may put another row at the top than the one asked
+        for (SE16's multiple selection: 7 for 9), so ``position`` in the
+        result is read back from the table: cell IDs count visible rows
+        from there.  ``requested_position`` appears when the two differ.
+
+        Args:
+            table_id: SAP GUI table control ID
+            position: Absolute row position to scroll to
+
+        Returns:
+            Dict with new scroll position and visible data summary
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(table_id)
+            if getattr(table, 'Type', '') != "GuiTableControl":
+                return {
+                    "table_id": table_id,
+                    "error": "Not a GuiTableControl. Use ALV grid methods.",
+                }
+
+            scrollbar = table.VerticalScrollbar
+            scroll_max = scrollbar.Maximum
+            new_pos = max(scrollbar.Minimum, min(position, scroll_max))
+            full_id = table.Id  # capture before the reference goes stale
+            try:
+                scrollbar.Position = new_pos
+            except Exception as scroll_err:
+                # Some popup tables throw COM errors on scroll.
+                # Return diagnostic info so the caller can use
+                # navigation buttons or Position... dialog instead.
+                return {
+                    "table_id": table_id,
+                    "error": self._sanitize_error_message(
+                        scroll_err,
+                        "Could not scroll table control",
+                    ),
+                    "requested_position": position,
+                    "clamped_position": new_pos,
+                    "scroll_max": scroll_max,
+                    "total_rows": table.RowCount,
+                    "hint": "Scrollbar failed; use navigation buttons or Position dialog.",
+                }
+
+            # The scroll round-trip re-renders the control and invalidates
+            # existing references — re-acquire before reading row counts.
+            try:
+                table = self._session.findById(full_id)
+            except Exception:
+                pass
+
+            top = table.VerticalScrollbar.Position
+            result = {
+                "table_id": table_id,
+                "status": "success",
+                "position": top,
+                "visible_rows": table.VisibleRowCount,
+                "total_rows": table.RowCount,
+                "scroll_max": scroll_max,
+            }
+            if top != position:
+                result["requested_position"] = position
+            if top != new_pos:
+                result["note"] = (
+                    f"SAP put row {top} at the top, not {new_pos}: visible "
+                    f"row 0 in cell IDs is absolute row {top}."
+                )
+            return result
+        except Exception as e:
+            return self._error_result(
+                {"table_id": table_id},
+                e,
+                "Could not scroll table control",
+            )
+
+    def get_table_control_row_info(self, table_id: str,
+                                    rows: Optional[List[int]] = None) -> Dict[str, Any]:
+        """
+        Get row metadata from a GuiTableControl.
+
+        Returns whether each row is selectable and currently selected,
+        using GetAbsoluteRow() for absolute indexing.
+
+        Args:
+            table_id: SAP GUI table control ID
+            rows: List of absolute row indices to query.
+                  If None, queries all currently visible rows.
+
+        Returns:
+            Dict with row info list
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(table_id)
+            if getattr(table, 'Type', '') != "GuiTableControl":
+                return {"table_id": table_id, "error": "Not a GuiTableControl"}
+
+            if rows is None:
+                start = table.VerticalScrollbar.Position
+                rows = list(range(start, start + table.VisibleRowCount))
+
+            row_info = []
+            for r in rows:
+                info: Dict[str, Any] = {"row": r}
+                try:
+                    abs_row = table.GetAbsoluteRow(r)
+                    info["selectable"] = getattr(abs_row, 'Selectable', True)
+                    info["selected"] = getattr(abs_row, 'Selected', False)
+                except Exception as e:
+                    info["error"] = self._sanitize_error_message(
+                        e,
+                        "Could not inspect table row",
+                    )
+                row_info.append(info)
+
+            return {
+                "table_id": table_id,
+                "row_count": len(row_info),
+                "rows": row_info,
+            }
+        except Exception as e:
+            return self._error_result(
+                {"table_id": table_id},
+                e,
+                "Could not read table row info",
+            )
+
+    def select_all_table_control_columns(self, table_id: str,
+                                          select: bool = True) -> Dict[str, Any]:
+        """
+        Select or deselect all columns in a GuiTableControl.
+
+        Args:
+            table_id: SAP GUI table control ID
+            select: True to select all, False to deselect all
+
+        Returns:
+            Dict with result status
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(table_id)
+            if getattr(table, 'Type', '') != "GuiTableControl":
+                return {"table_id": table_id, "error": "Not a GuiTableControl"}
+
+            if select:
+                table.SelectAllColumns()
+            else:
+                table.DeselectAllColumns()
+
+            return {
+                "table_id": table_id,
+                "status": "all_selected" if select else "all_deselected",
+            }
+        except Exception as e:
+            return self._error_result(
+                {"table_id": table_id},
+                e,
+                "Could not change table column selection",
+            )
+
+    # ---- ALV-specific operations ----
+
+    def get_cell_info(self, grid_id: str, row: int,
+                      column: str) -> Dict[str, Any]:
+        """
+        Get detailed cell metadata from an ALV grid (GuiGridView).
+
+        Returns whether the cell is editable, what kind of cell it is
+        (cell_type: Normal, CheckBox, ValueList, Button, ...), its state
+        (Normal, Error, Warning, Info), F4 help, hotspot, colour and tooltip;
+        plus the checkbox state or the dropdown position where they apply.
+
+        Args:
+            grid_id: SAP GUI grid ID (ALV)
+            row: Row index (0-based)
+            column: Column name
+
+        Returns:
+            Dict with cell properties
+        """
+        self._require_session()
+
+        try:
+            grid = self._find_element(grid_id)
+            info: Dict[str, Any] = {
+                "grid_id": grid_id,
+                "row": row,
+                "column": column,
+                "value": grid.GetCellValue(row, column),
+            }
+
+            def read(method, key):
+                # Members newer than the user's SAP GUI (or not meaningful
+                # for this cell) raise: leave the key out.
+                try:
+                    info[key] = getattr(grid, method)(row, column)
+                except Exception:
+                    pass
+
+            for method, key in [
+                ("GetCellType", "cell_type"),
+                ("GetCellChangeable", "changeable"),
+                ("GetCellState", "state"),
+                ("HasCellF4Help", "f4_help"),
+                ("IsCellHotspot", "hotspot"),
+                ("GetCellColor", "color"),
+                ("GetCellTooltip", "tooltip"),
+                ("GetCellMaxLength", "max_length"),
+            ]:
+                read(method, key)
+
+            if info.get("hotspot"):
+                read("GetCellHotspotType", "hotspot_type")  # SAP GUI 8.00+
+            if info.get("cell_type") == "CheckBox":
+                read("GetCellCheckBoxChecked", "checked")
+            elif info.get("cell_type") == "ValueList":
+                read("GetCellListBoxCount", "list_box_count")      # 8.00+
+                # Index and value of the focused entry exist only while the
+                # dropdown is open (closed: -1 and ""), so report them then.
+                read("GetCellListBoxCurIndex", "list_box_index")   # 8.00+
+                if info.get("list_box_index", -1) >= 0:
+                    read("GetCellListBoxCurValue", "list_box_value")   # 8.10+
+                else:
+                    info.pop("list_box_index", None)
+
+            return info
+        except Exception as e:
+            return self._error_result(
+                {"grid_id": grid_id, "row": row, "column": column},
+                e,
+                "Could not read cell information",
+            )
+
+    def press_column_header(self, grid_id: str,
+                             column: str) -> Dict[str, Any]:
+        """
+        Click a column header in an ALV grid (triggers sort/filter).
+
+        Args:
+            grid_id: SAP GUI grid ID (ALV)
+            column: Column name
+
+        Returns:
+            Dict with result status and screen info
+        """
+        self._require_session()
+
+        try:
+            grid = self._find_element(grid_id)
+            grid.PressColumnHeader(column)
+            return {
+                "grid_id": grid_id,
+                "column": column,
+                "status": "pressed",
+                "screen": self.get_screen_info(),
+            }
+        except Exception as e:
+            return self._error_result(
+                {"grid_id": grid_id, "column": column},
+                e,
+                "Could not press column header",
+            )
+
+    def select_all_rows(self, grid_id: str) -> Dict[str, Any]:
+        """
+        Select all rows in an ALV grid.
+
+        Args:
+            grid_id: SAP GUI grid ID (ALV)
+
+        Returns:
+            Dict with result status
+        """
+        self._require_session()
+
+        try:
+            grid = self._find_element(grid_id)
+            grid.SelectAll()
+            return {"grid_id": grid_id, "status": "all_selected"}
+        except Exception as e:
+            return self._error_result(
+                {"grid_id": grid_id},
+                e,
+                "Could not select all rows",
+            )
+
+    # ---- Operations for both table types ----
+
+    def get_current_cell(self, table_id: str) -> Dict[str, Any]:
+        """
+        Get the currently focused cell in an ALV grid or table control.
+
+        Args:
+            table_id: SAP GUI grid/table ID
+
+        Returns:
+            Dict with current row and column
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(table_id)
+
+            if getattr(table, 'Type', '') == "GuiTableControl":
+                return {
+                    "table_id": table_id,
+                    "table_type": "GuiTableControl",
+                    "current_row": getattr(table, 'CurrentRow', -1),
+                    "current_col": getattr(table, 'CurrentCol', -1),
+                }
+            else:
+                return {
+                    "table_id": table_id,
+                    "table_type": "GuiGridView",
+                    "current_row": getattr(table, 'CurrentCellRow', -1),
+                    "current_column": getattr(table, 'CurrentCellColumn', ''),
+                }
+        except Exception as e:
+            return self._error_result(
+                {"table_id": table_id},
+                e,
+                "Could not read current cell",
+            )
+
+    # =========================================================================
+    # Multi-Row Selection
+    # =========================================================================
+
+    def select_multiple_rows(
+        self, table_id: str, rows: List[int],
+    ) -> Dict[str, Any]:
+        """
+        Select multiple rows in an ALV grid or table control.
+
+        For ALV grids, uses the SelectedRows property which accepts
+        comma-separated row indices (e.g., "0,2,5").
+
+        For GuiTableControl, iterates and sets Selected on each
+        absolute row.
+
+        Args:
+            table_id: SAP GUI table/grid ID
+            rows: List of row indices to select
+
+        Returns:
+            Dict with selection result
+        """
+        self._require_session()
+
+        try:
+            table = self._find_element(table_id)
+
+            if getattr(table, 'Type', '') == "GuiTableControl":
+                for row in rows:
+                    table, _ = self._scroll_table_control_to_row(
+                        table, row, need_visible=False,
+                    )
+                    table.GetAbsoluteRow(row).Selected = True
+            else:
+                # ALV: comma-separated row list
+                table.SelectedRows = ",".join(str(r) for r in rows)
+
+            return {
+                "table_id": table_id,
+                "selected_rows": rows,
+                "count": len(rows),
+                "status": "success",
+            }
+        except Exception as e:
+            return self._error_result(
+                {"table_id": table_id},
+                e,
+                "Could not select multiple rows",
+            )

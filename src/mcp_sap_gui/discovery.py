@@ -1,0 +1,1791 @@
+"""
+Discovery Mixin - popups, toolbars, shell content, screen elements, screenshots.
+
+Provides screen discovery, popup handling, toolbar enumeration, and
+screenshot capabilities for the SAP GUI controller.
+"""
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+from .models import SAPGUIError, ScreenElement
+
+
+@dataclass
+class _PopupFindings:
+    """Parts of a popup that are summarised rather than listed one by one."""
+
+    list_rows: Dict[str, List[int]] = field(default_factory=dict)
+    calendars: List[str] = field(default_factory=list)
+    # SAP's message popup (SAPMSDYP): its text fields are MESSTXT1.., its
+    # icon field IK1 shows the message type as an icon (live: M_INFO for I).
+    message_popup: bool = False
+    message_icon: str = ""
+    # SAP's confirmation popup (SAPLSPO1 0500) draws its question in an HTML
+    # viewer, not in text fields.
+    html_viewers: List[str] = field(default_factory=list)
+
+logger = logging.getLogger(__name__)
+
+# GuiFrameWindow.HardCopy image type. It must be the numeric constant: a
+# string like "PNG" is ignored and SAP GUI writes an uncompressed BMP
+# (18 MB for a maximised window, versus 1.3 MB as PNG).
+_HARDCOPY_PNG = 2
+
+
+class DiscoveryMixin:
+    """Mixin for discovery and inspection operations on SAP GUI screens."""
+
+    _POPUP_INTERACTIVE_TYPES = (
+        "GuiTextField",
+        "GuiCTextField",
+        "GuiPasswordField",
+        "GuiComboBox",
+        "GuiCheckBox",
+        "GuiRadioButton",
+        "GuiTableControl",
+        "GuiGridView",
+        "GuiTree",
+    )
+    _POPUP_ERROR_PATTERNS = (
+        "error",
+        "failed",
+        "cannot",
+        "can not",
+        "not possible",
+        "not found",
+        "does not exist",
+        "required",
+        "invalid",
+    )
+    _POPUP_INFO_PATTERNS = (
+        "information",
+        "info",
+        "success",
+        "completed",
+        "saved",
+        "created",
+        "displayed",
+    )
+    _POPUP_INPUT_PATTERNS = (
+        "enter",
+        "select",
+        "choose",
+        "specify",
+        "values",
+        "parameters",
+        "selection",
+        "organization",
+        "warehouse",
+        "plant",
+    )
+    _POPUP_CONFIRMATION_PATTERNS = (
+        "do you want",
+        "are you sure",
+        "save changes",
+        "discard",
+        "overwrite",
+        "delete",
+        "confirm",
+        "continue?",
+        "proceed",
+    )
+
+    # =========================================================================
+    # Popup Window Handling
+    # =========================================================================
+
+    def get_popup_window(self) -> Dict[str, Any]:
+        """
+        Check if a popup window (modal dialog) is currently open.
+
+        SAP popups appear as wnd[1], wnd[2], etc.  Returns the topmost
+        popup's title, text content, and available buttons so the AI can
+        decide how to respond, plus a coarse classification and safe
+        next-action hint.
+
+        Returns:
+            Dict with popup info or {"popup_exists": False}
+        """
+        self._require_session()
+
+        # Find the topmost window above wnd[0]
+        popup_wnd = None
+        popup_id = None
+        for i in range(1, 10):
+            wnd_id = f"wnd[{i}]"
+            try:
+                wnd = self._session.findById(wnd_id)
+                popup_wnd = wnd
+                popup_id = wnd_id
+            except Exception:
+                break
+
+        if popup_wnd is None:
+            return {"popup_exists": False}
+
+        result: Dict[str, Any] = {"popup_exists": True, "window_id": popup_id}
+        texts = []
+        buttons = []
+        interactive_elements = []
+        found = _PopupFindings()
+        tree = self._object_tree(popup_id, self._POPUP_PROPS, site="popup")
+        if tree is not None:
+            self._read_popup_tree(tree, result, texts, buttons,
+                                  interactive_elements, found)
+        else:
+            self._read_popup_com(popup_id, popup_wnd, result, texts, buttons,
+                                 interactive_elements, found)
+
+        # An F4 hit list is a classic list: one cell per word, hundreds for a
+        # long one. Summarise it; sap_read_list shows it line by line.
+        rows = [row for cells in found.list_rows.values() for row in cells]
+        if rows:
+            result["list"] = {
+                "cells": len(rows),
+                "rows": len(set(rows)),
+                "hint": (
+                    f"Classic list (e.g. an F4 hit list): read it with "
+                    f"sap_read_list(window_id='{popup_id}'). To pick a line, "
+                    f"read with with_ids=true, sap_set_focus that line's ID, "
+                    f"then Enter."
+                ),
+            }
+        if found.calendars:
+            result["calendar"] = self._calendar_summary(found.calendars[0])
+        if found.message_popup:
+            self._read_message_popup_type(result, found.message_icon)
+        if found.html_viewers:
+            self._read_popup_html(found.html_viewers, texts, result)
+
+        if texts:
+            result["texts"] = texts
+        if buttons:
+            result["buttons"] = buttons
+        if interactive_elements:
+            result["interactive_elements"] = interactive_elements
+            result["has_inputs"] = True
+        else:
+            result["has_inputs"] = False
+
+        time_picker = self._time_picker_summary(interactive_elements)
+        if time_picker:
+            # Its hint says what the pre-filled notice would: Continue
+            # enters the time shown, the current time.
+            result["time_picker"] = time_picker
+        else:
+            prefilled = self._prefilled_inputs(interactive_elements)
+            if prefilled:
+                result["prefilled_inputs"] = prefilled
+                result["notice"] = self._PREFILL_NOTICE
+
+        return self._classify_popup(result)
+
+    # Deliberately generic: no popup is recognised by name. Any dialog whose
+    # changeable inputs already hold values gets the same notice, because a
+    # confirm accepts defaults the agent never chose (a transport request
+    # prompt pre-filled with another project's request is one such case).
+    # A preselected radio button or checkbox is such a default too: SCAL's
+    # holiday dialog opens with "with fixed date" selected.
+    _PREFILL_TYPES = ("GuiTextField", "GuiCTextField", "GuiComboBox")
+    _PREFILL_NOTICE = (
+        "This popup has pre-filled input values or preselected options. "
+        "Confirming accepts them as they are: verify each one is what the "
+        "user intends, and change it first if it is not."
+    )
+
+    def _prefilled_inputs(self, interactive_elements: list) -> list:
+        """Changeable inputs of a popup that already hold a value, and
+        changeable radio buttons and checkboxes that are selected."""
+        prefilled = []
+        for el in interactive_elements:
+            if not el.get("changeable"):
+                continue
+            if el.get("type") in self._PREFILL_TYPES and el.get("text"):
+                prefilled.append({
+                    "id": el["id"],
+                    "name": el.get("name", ""),
+                    "value": self._mask_field_value(el["id"], el["text"]),
+                })
+            elif el.get("type") in self._SELECTABLE_TYPES and el.get("selected"):
+                prefilled.append({
+                    "id": el["id"],
+                    "name": el.get("name", ""),
+                    "text": el.get("text", ""),
+                    "selected": True,
+                })
+        return prefilled
+
+    def _popup_digest(self) -> Dict[str, Any]:
+        """Compact summary of the open popup, attached to action responses.
+
+        The title is left out: screen info already reads it from the active
+        window. Full details (element IDs) stay with get_popup_window.
+        """
+        try:
+            popup = self.get_popup_window()
+        except Exception:
+            return {}
+        if not popup.get("popup_exists"):
+            return {}
+
+        digest: Dict[str, Any] = {
+            "classification": popup.get("classification", "unknown"),
+        }
+        texts = popup.get("texts") or []
+        if texts:
+            digest["texts"] = [str(t)[:200] for t in texts[:6]]
+        buttons = [
+            b.get("text") or b.get("tooltip") for b in popup.get("buttons", [])
+        ]
+        buttons = [b for b in buttons if b]
+        if buttons:
+            digest["buttons"] = buttons
+        for key in ("list", "calendar", "time_picker", "prefilled_inputs",
+                    "notice", "question_readable", "question_note"):
+            if key in popup:
+                digest[key] = popup[key]
+        return digest
+
+    _POPUP_PROPS = ["Id", "Type", "SubType", "Name", "Text", "Tooltip",
+                    "Changeable", "MessageType", "IconName"]
+
+    _UNREADABLE_QUESTION_NOTE = (
+        "This popup shows its text in an HTML viewer that scripts cannot "
+        "read (the Edge browser control). See it with sap_screenshot, or ask "
+        "the user. Any answer but Cancel asks the user first."
+    )
+
+    def _read_popup_html(self, viewer_ids: List[str], texts: list,
+                         result: Dict[str, Any]) -> None:
+        """Add the text of a popup's HTML viewers to *texts*.
+
+        Live on SAP GUI 8.10 (A4H, any theme, accessibility on or off), the
+        question of SAP's confirmation popup ("Program X was changed. Save
+        before exiting editor?") is readable with the Internet Explorer
+        control only. With Edge, the default, the popup is marked
+        question_readable: false.
+        """
+        for viewer_id in viewer_ids:
+            info: Dict[str, Any] = {}
+            try:
+                self._read_html_viewer(self._session.findById(viewer_id), info)
+            except Exception as e:
+                logger.debug("Popup HTML viewer %s not readable: %s", viewer_id, e)
+            text = " ".join(str(info.get("text", "")).split())
+            if text:
+                texts.append(text[:1000])
+            else:
+                result["question_readable"] = False
+        if result.get("question_readable") is False:
+            result["question_note"] = self._UNREADABLE_QUESTION_NOTE
+
+    # Field names are not translated: this recognises SAP's message popup in
+    # any logon language, where its title ("Warning") would not.
+    _MESSAGE_FIELD_RE = re.compile(r"MESSTXT\d+$")
+    _MESSAGE_ICON_RE = re.compile(r"IK\d+$")
+    # Icon names seen live. Only the information icon is mapped: a type
+    # guessed wrong could let a warning be auto-continued.
+    _MESSAGE_ICON_TYPES = {"M_INFO": "I"}
+
+    def _read_message_popup_type(self, result: Dict[str, Any],
+                                 icon: str) -> None:
+        """Mark SAP's message popup and find its message type.
+
+        The popup has no status message of its own (and on A4H the main
+        window's MessageAsPopup stayed False): the type is the icon of its
+        IK1 field. An unknown type keeps the popup out of auto-handling
+        (_classify_popup), as a warning could be behind it.
+        """
+        result["message_popup"] = True
+        if result.get("message_type"):
+            return
+        if icon in self._MESSAGE_ICON_TYPES:
+            result["message_type"] = self._MESSAGE_ICON_TYPES[icon]
+            return
+        try:
+            sbar = self._session.findById("wnd[0]/sbar")
+            if sbar.MessageAsPopup:
+                result["message_type"] = str(sbar.MessageType or "")
+        except Exception:
+            pass
+
+    # F4 on a time field (SAPLSHL3 101, "Choose Time"): three dropdowns.
+    _TIME_PICKER_RE = re.compile(r"SHL3_TIME-S(HOUR|MINUTE|SECOND)$")
+
+    def _time_picker_summary(self, interactive_elements: list) -> Dict[str, Any]:
+        """What an agent needs about the F4 time picker, or {} for others."""
+        parts = {}
+        for el in interactive_elements:
+            match = self._TIME_PICKER_RE.search(el.get("name", ""))
+            if match and el.get("type") == "GuiComboBox":
+                parts[match.group(1).lower()] = el
+        if len(parts) != 3:
+            return {}
+        order = ("hour", "minute", "second")
+        summary: Dict[str, Any] = {f"{part}_id": parts[part]["id"] for part in order}
+        summary["shown"] = ":".join(parts[part].get("text", "") for part in order)
+        summary["hint"] = (
+            "Time picker (F4 on a time field). It shows the CURRENT time: "
+            "Continue enters that. To enter a time, cancel it and type the "
+            "time into the field with sap_set_field (HH:MM:SS), or set the "
+            "three dropdowns (two-digit keys, e.g. '08') with "
+            "sap_set_batch_fields and press Enter."
+        )
+        return summary
+
+    def _calendar_summary(self, calendar_id: str) -> Dict[str, Any]:
+        """What an agent needs about the F4 date picker (a Calendar shell)."""
+        summary: Dict[str, Any] = {"id": calendar_id}
+        try:
+            summary["focus_date"] = str(self._session.findById(calendar_id).focusDate)
+        except Exception:
+            pass
+        summary["hint"] = (
+            "Date picker (F4 on a date field). To enter a date, cancel it and "
+            "type the date into the field with sap_set_field, in the format "
+            "the field shows (e.g. 10.10.2026). Continue copies the focused "
+            "date (focus_date, YYYYMMDD) into the field."
+        )
+        return summary
+
+    def _file_popup_element(self, ctype: str, text: str, read,
+                            texts: list, buttons: list,
+                            interactive_elements: list,
+                            found: _PopupFindings) -> None:
+        """File one popup element under buttons, inputs or texts, or note it
+        in *found* (classic-list cells, calendars).
+
+        read(name, default) returns a further property, so the COM path only
+        reads Id / SubType / Tooltip / Name / Changeable where they are used.
+        read('Selected', None) goes over COM on both paths (_selected).
+        """
+        if ctype in ('GuiLabel', 'GuiCheckBox', 'GuiTextField'):
+            element_id = self._normalize_element_id(read('Id', ''))
+            if self._tally_list_cell(element_id, found.list_rows):
+                return
+        if ctype == 'GuiShell':
+            sub_type = read('SubType', '')
+            if sub_type == 'Calendar':
+                found.calendars.append(self._normalize_element_id(read('Id', '')))
+            elif sub_type == 'HTMLViewer':
+                found.html_viewers.append(self._normalize_element_id(read('Id', '')))
+            return
+        if ctype == 'GuiButton':
+            buttons.append({
+                "id": self._normalize_element_id(read('Id', '')),
+                "text": text,
+                "tooltip": read('Tooltip', '').strip(),
+            })
+        elif ctype in self._POPUP_INTERACTIVE_TYPES:
+            changeable = read('Changeable', None)
+            if changeable is False and ctype in ('GuiTextField', 'GuiCTextField'):
+                # SAP's message popup (SAPMSDYP) shows the message in
+                # display-only fields: it is text, not an input.
+                name = read('Name', '')
+                if self._MESSAGE_FIELD_RE.search(name):
+                    found.message_popup = True
+                elif self._MESSAGE_ICON_RE.search(name):
+                    found.message_icon = read('IconName', '')
+                if text:
+                    texts.append(text)
+                return
+            element = {
+                "id": self._normalize_element_id(read('Id', '')),
+                "type": ctype,
+                "name": read('Name', ''),
+                "text": text,
+                "changeable": changeable,
+            }
+            if ctype in self._SELECTABLE_TYPES:
+                selected = read('Selected', None)
+                if selected is not None:
+                    element["selected"] = selected
+            interactive_elements.append(element)
+        elif text and ctype in (
+            'GuiTextField', 'GuiCTextField', 'GuiLabel',
+            'GuiTitlebar', 'GuiStatusbar',
+        ):
+            texts.append(text)
+
+    def _read_popup_tree(self, window: Dict[str, Any], result: Dict[str, Any],
+                         texts: list, buttons: list, interactive_elements: list,
+                         found: _PopupFindings) -> None:
+        """Title, status message, contents and toolbar buttons of a popup
+        from its GetObjectTree node: the same fields _read_popup_com reads."""
+        result["title"] = (window.get("properties") or {}).get("Text", "")
+        areas = {}
+        for node in window.get("children") or []:
+            node_id = (node.get("properties") or {}).get("Id", "")
+            areas[node_id.rsplit("/", 1)[-1]] = node
+
+        if "sbar" in areas:
+            sbar = areas["sbar"].get("properties") or {}
+            result["message"] = sbar.get("Text", "")
+            result["message_type"] = sbar.get("MessageType", "")
+
+        def collect(node, depth):
+            if depth > 3:
+                return
+            for child in node.get("children") or []:
+                props = child.get("properties") or {}
+
+                def read(name, default, props=props):
+                    if name == "Selected":  # never in the tree
+                        return self._selected(props.get("Id", ""))
+                    value = props.get(name, "")
+                    if name == "Changeable":
+                        return {"true": True, "false": False}.get(value, default)
+                    return value or default
+
+                self._file_popup_element(
+                    props.get("Type", ""), props.get("Text", "").strip(), read,
+                    texts, buttons, interactive_elements, found,
+                )
+                collect(child, depth + 1)
+
+        if "usr" in areas:
+            collect(areas["usr"], 0)
+        # Toolbar buttons (tbar[0] for OK/Cancel) after the user area's.
+        for tbar in ("tbar[0]", "tbar[1]"):
+            for btn in (areas.get(tbar) or {}).get("children") or []:
+                props = btn.get("properties") or {}
+                if props.get("Type") == "GuiButton":
+                    buttons.append({
+                        "id": self._normalize_element_id(props.get("Id", "")),
+                        "text": props.get("Text", "").strip(),
+                        "tooltip": props.get("Tooltip", "").strip(),
+                    })
+
+    def _read_popup_com(self, popup_id: str, popup_wnd, result: Dict[str, Any],
+                        texts: list, buttons: list, interactive_elements: list,
+                        found: _PopupFindings) -> None:
+        """_read_popup_tree over COM, for SAP GUI before 7.70 PL3."""
+        result["title"] = getattr(popup_wnd, 'Text', '')
+
+        # Read the status bar message in the popup if any
+        try:
+            sbar = self._session.findById(f"{popup_id}/sbar")
+            result["message"] = sbar.Text
+            result["message_type"] = getattr(sbar, 'MessageType', '')
+        except Exception:
+            pass
+
+        # Collect text elements and buttons from the user area
+        try:
+            usr = self._session.findById(f"{popup_id}/usr")
+            self._collect_popup_contents(usr, texts, buttons, interactive_elements,
+                                         found=found)
+        except Exception:
+            pass
+
+        # Also check toolbar buttons (tbar[0] for OK/Cancel)
+        for tbar_idx in range(2):
+            try:
+                tbar = self._session.findById(f"{popup_id}/tbar[{tbar_idx}]")
+                for i in range(tbar.Children.Count):
+                    btn = tbar.Children(i)
+                    if getattr(btn, 'Type', '') in ('GuiButton',):
+                        buttons.append({
+                            "id": self._normalize_element_id(btn.Id),
+                            "text": getattr(btn, 'Text', '').strip(),
+                            "tooltip": getattr(btn, 'Tooltip', '').strip(),
+                        })
+            except Exception:
+                pass
+
+    def _collect_popup_contents(
+        self,
+        container,
+        texts: list,
+        buttons: list,
+        interactive_elements: list,
+        depth: int = 0,
+        found: _PopupFindings | None = None,
+    ) -> None:
+        """Recursively collect text and buttons from a popup's user area."""
+        if found is None:
+            found = _PopupFindings()
+        if depth > 3:
+            return
+        try:
+            children = container.Children  # once: see _enumerate_elements
+            for i in range(children.Count):
+                child = children(i)
+
+                def read(name, default, child=child):
+                    if name == "Selected":
+                        return self._selected(element=child)
+                    return getattr(child, name, default)
+
+                self._file_popup_element(
+                    getattr(child, 'Type', ''), getattr(child, 'Text', '').strip(), read,
+                    texts, buttons, interactive_elements, found,
+                )
+
+                # Not hasattr(): see _enumerate_elements.
+                try:
+                    has_children = child.Children.Count > 0
+                except Exception:
+                    has_children = False
+                if has_children:
+                    self._collect_popup_contents(
+                        child,
+                        texts,
+                        buttons,
+                        interactive_elements,
+                        depth + 1,
+                        found,
+                    )
+        except Exception:
+            pass
+
+    def _popup_text_blob(self, popup: Dict[str, Any]) -> str:
+        """Build a lowercase text blob from popup title/message/texts."""
+        parts = [
+            popup.get("title", ""),
+            popup.get("message", ""),
+            *popup.get("texts", []),
+        ]
+        return " ".join(part for part in parts if part).lower()
+
+    def _classify_popup(self, popup: Dict[str, Any]) -> Dict[str, Any]:
+        """Classify popup intent and suggest a safe next action."""
+        buttons = popup.get("buttons", [])
+        text_blob = self._popup_text_blob(popup)
+        message_type = popup.get("message_type", "")
+        has_inputs = popup.get("has_inputs", False)
+        has_confirm = self._match_button(buttons, self._CONFIRM_PATTERNS) is not None
+        has_cancel = self._match_button(buttons, self._CANCEL_PATTERNS) is not None
+
+        if message_type == "E" or any(p in text_blob for p in self._POPUP_ERROR_PATTERNS):
+            classification = "error"
+        elif message_type == "W" or "warning" in text_blob:
+            # Never auto-continued: a warning can stand between the user and
+            # a save that continuing would complete.
+            classification = "warning"
+        elif popup.get("list"):
+            # A hit list offers "Apply", not "OK": the old rules called it
+            # information and auto-cancelled the value help.
+            classification = "list"
+        elif popup.get("calendar"):
+            # Continue/Cancel made it look like a confirmation; continuing
+            # writes the focused date (today) into the field.
+            classification = "date_picker"
+        elif popup.get("time_picker"):
+            # Like the calendar: Continue writes the current time.
+            classification = "time_picker"
+        elif (popup.get("question_readable") is False and len(buttons) > 1
+              and not has_inputs):
+            # A question we cannot read, with answers to choose from. The
+            # word tests below need English (live: Ja / Nein / Abbrechen
+            # came out "unknown").
+            classification = "confirmation"
+        elif has_inputs or any(p in text_blob for p in self._POPUP_INPUT_PATTERNS):
+            classification = "input_required"
+        elif (
+            any(p in text_blob for p in self._POPUP_CONFIRMATION_PATTERNS)
+            or ("?" in text_blob and (has_confirm or has_cancel))
+        ):
+            classification = "confirmation"
+        elif has_confirm and has_cancel:
+            classification = "confirmation"
+        elif (
+            message_type in ("S", "I")
+            or any(p in text_blob for p in self._POPUP_INFO_PATTERNS)
+            or (has_confirm and not has_cancel and not has_inputs)
+            or (has_cancel and not has_confirm and not has_inputs)
+        ):
+            classification = "information"
+        else:
+            classification = "unknown"
+
+        recommended_action = "read"
+        safe_auto_action = None
+        # A message popup of unknown type may be a warning: the title test
+        # above only knows the English word.
+        unverified_message = (popup.get("message_popup")
+                              and message_type not in ("I", "S"))
+        if (classification == "information" and not has_inputs
+                and not unverified_message):
+            if has_confirm and not has_cancel:
+                recommended_action = "confirm"
+                safe_auto_action = "confirm"
+            elif has_cancel and not has_confirm:
+                recommended_action = "cancel"
+                safe_auto_action = "cancel"
+
+        popup["classification"] = classification
+        popup["recommended_action"] = recommended_action
+        if safe_auto_action is not None:
+            popup["safe_auto_action"] = safe_auto_action
+        return popup
+
+    # =========================================================================
+    # Popup Workflow
+    # =========================================================================
+
+    _CONFIRM_PATTERNS = ("ok", "yes", "continue", "confirm", "execute", "save")
+    _CANCEL_PATTERNS = ("cancel", "no", "abort", "close", "back")
+    # Words that make a popup save-shaped: SAP's "Save the changes first?"
+    # dialog, or a button that saves. English plus the common logon
+    # languages; a substring match, so "unsaved" counts too (errs towards
+    # asking).
+    _SAVE_PATTERNS = (
+        "save", "sichern", "speichern", "enregistrer", "guardar", "salvar",
+        "salvare", "opslaan",
+    )
+
+    def _popup_save_risk(
+        self, popup: Dict[str, Any], btn: Dict[str, Any] | None,
+    ) -> bool:
+        """True when pressing *btn* (None: the Enter fallback) may save.
+
+        Either the button itself saves, or the popup's text is about saving
+        and it offers a choice (more than one button) or no button was
+        matched at all. A single-button "Data was saved" notice is not one.
+        """
+        if btn is not None and self._match_button([btn], self._SAVE_PATTERNS):
+            return True
+        text_blob = self._popup_text_blob(popup)
+        if not any(p in text_blob for p in self._SAVE_PATTERNS):
+            return False
+        return btn is None or len(popup.get("buttons", [])) > 1
+
+    # A button that backs out of a popup, matched as a whole word. Not "No":
+    # on "Save before exiting editor?" No leaves and drops the changes. Not
+    # inside a word either: "Background" is no Back.
+    _CANCEL_BUTTON_RE = re.compile(
+        r"\b(cancel|abort|close|back|abbrechen|annuler|cancelar|annulla|annuleren)\b",
+        re.IGNORECASE,
+    )
+
+    def _is_cancel_button(self, btn: Dict[str, Any]) -> bool:
+        return any(self._CANCEL_BUTTON_RE.search(btn.get(key) or "")
+                   for key in ("text", "tooltip"))
+
+    def _unread_answer(
+        self, popup: Dict[str, Any], btn: Dict[str, Any] | None,
+    ) -> bool:
+        """True when pressing *btn* (None: the Enter fallback) answers a
+        question the tool cannot read (question_readable: false) and the
+        popup offers more than one answer. Only Cancel is exempt: unread,
+        Yes may save, and No may drop the changes."""
+        if popup.get("question_readable") is not False:
+            return False
+        if len(popup.get("buttons", [])) < 2:
+            return False
+        return btn is None or not self._is_cancel_button(btn)
+
+    def _top_popup_id(self) -> str | None:
+        """The ID of the topmost window above wnd[0], or None. No tree read."""
+        top = None
+        for i in range(1, 10):
+            wnd_id = f"wnd[{i}]"
+            try:
+                self._session.findById(wnd_id)
+            except Exception:
+                break
+            top = wnd_id
+        return top
+
+    def _match_button(
+        self, buttons: List[Dict[str, Any]], patterns: tuple,
+    ) -> Dict[str, Any] | None:
+        """Find first button whose text or tooltip matches any pattern."""
+        for btn in buttons:
+            text_lower = btn.get("text", "").lower()
+            tooltip_lower = btn.get("tooltip", "").lower()
+            for pattern in patterns:
+                if pattern in text_lower or pattern in tooltip_lower:
+                    return btn
+        return None
+
+    def handle_popup(
+        self, action: str = "read", button_text: str = "",
+    ) -> Dict[str, Any]:
+        """Read and optionally act on the current popup dialog.
+
+        Args:
+            action: ``read``, ``confirm``, ``cancel``, ``press``, or ``auto``.
+            button_text: required when *action* is ``press``.
+
+        Returns:
+            Dict with popup content, classification, and action taken.
+        """
+        return self.apply_popup_plan(self.plan_popup_action(action, button_text))
+
+    def plan_popup_action(
+        self, action: str = "read", button_text: str = "",
+    ) -> Dict[str, Any]:
+        """Read the popup once and decide what handle_popup would press.
+
+        Presses nothing. The plan's ``save_risk`` is True when the press
+        may save (see _popup_save_risk), so a caller can ask the user first
+        and then pass the plan to apply_popup_plan. ``done`` means there is
+        nothing to press and ``popup`` is already the result.
+        """
+        self._require_session()
+
+        popup = self.get_popup_window()
+        plan: Dict[str, Any] = {
+            "popup": popup, "action": action, "button": None,
+            "fallback_vkey": None, "save_risk": False, "done": True,
+        }
+        if not popup.get("popup_exists"):
+            plan["popup"] = {"popup_exists": False, "action": "none"}
+            return plan
+
+        popup["action_requested"] = action
+        all_buttons = popup.get("buttons", [])
+
+        if action == "read":
+            popup["action"] = "read"
+            return plan
+
+        if action == "auto":
+            decision = popup.get("safe_auto_action") or "read"
+            if decision == "confirm" and self._popup_save_risk(
+                popup, self._match_button(all_buttons, self._CONFIRM_PATTERNS),
+            ):
+                decision = "read"  # a save is never a clearly safe action
+            popup["auto_decision"] = decision
+            if decision == "read":
+                popup["action"] = "read"
+                return plan
+            action = decision
+            plan["action"] = action
+
+        if action == "press" and not button_text:
+            raise ValueError(
+                "button_text is required when action='press'"
+            )
+
+        # Determine which button to press
+        btn = None
+        fallback_vkey = None
+
+        if action == "confirm":
+            btn = self._match_button(all_buttons, self._CONFIRM_PATTERNS)
+            fallback_vkey = 0  # Enter
+        elif action == "cancel":
+            # A Cancel-type button, else F12. Never "No": live on "Save
+            # before exiting editor?" it was matched first ("no") and left
+            # the editor without saving.
+            btn = next((b for b in all_buttons if self._is_cancel_button(b)), None)
+            fallback_vkey = 12  # F12
+            if btn is None and not self._f12_allowed(popup["window_id"]):
+                popup["action"] = "error"
+                popup["error"] = (
+                    "This popup has no Cancel button and F12 is not active, "
+                    "so nothing was pressed. Press the answer you mean with "
+                    "action='press' and its text. Available: "
+                    f"{[b.get('text') or b.get('tooltip') for b in all_buttons]}"
+                )
+                return plan
+        elif action == "press":
+            needle = button_text.lower()
+            for b in all_buttons:
+                text_l = b.get("text", "").lower()
+                tooltip_l = b.get("tooltip", "").lower()
+                if needle in text_l or needle in tooltip_l:
+                    btn = b
+                    break
+            if btn is None:
+                popup["action"] = "error"
+                popup["error"] = (
+                    f"No button matching '{button_text}'. "
+                    f"Available: {[b.get('text') or b.get('tooltip') for b in all_buttons]}"
+                )
+                return plan
+        else:
+            raise ValueError(
+                f"Invalid action '{action}'. Use read, confirm, cancel, press, or auto."
+            )
+
+        # A press counts as affirmative unless the button reads as a
+        # cancel: "Ja" or an icon-only button may well be the save.
+        affirmative = action == "confirm" or (
+            action == "press"
+            and self._match_button([btn], self._CANCEL_PATTERNS) is None
+        )
+        save_risk = affirmative and self._popup_save_risk(popup, btn)
+        unread = action != "cancel" and self._unread_answer(popup, btn)
+        if (save_risk or unread) and btn is None:
+            # Enter would take the dialog's default button, unseen: on a
+            # save-shaped popup that can be the save itself.
+            popup["action"] = "error"
+            popup["error"] = (
+                ("This popup looks like a save prompt" if save_risk
+                 else "This popup's question cannot be read")
+                + " and no confirm button was recognised, so Enter was not "
+                "sent. Nothing was pressed. Use action='press' with the "
+                "button's text. Available: "
+                f"{[b.get('text') or b.get('tooltip') for b in all_buttons]}"
+            )
+            return plan
+
+        plan.update(button=btn, fallback_vkey=fallback_vkey,
+                    save_risk=save_risk or unread, unread_question=unread,
+                    done=False)
+        return plan
+
+    def _f12_allowed(self, window_id: str) -> bool:
+        try:
+            return self._vkey_allowed(self._find_window(window_id), 12)
+        except Exception:
+            return True  # cannot be asked: send it, as before
+
+    def plan_popup_button(self, button_id: str) -> Dict[str, Any] | None:
+        """sap_press_button's check: a plan when *button_id* is a button of
+        the topmost popup that needs the user first, else None.
+
+        The rules of plan_popup_action's press: a Save button, Yes/OK on a
+        popup about saving, or any answer but Cancel to a question the tool
+        cannot read. Without this, pressing wnd[1]/usr/btnBUTTON_1 by ID
+        answered what sap_handle_popup asks about. Reads the popup only for
+        a button outside wnd[0]; presses nothing.
+        """
+        self._require_session()
+        element_id = self._normalize_element_id(button_id)
+        match = re.match(r"(wnd\[(\d+)\])/", element_id)
+        if not match or match.group(2) == "0":
+            return None
+        popup = self.get_popup_window()
+        if popup.get("window_id") != match.group(1):
+            return None
+        btn = next((b for b in popup.get("buttons", [])
+                    if b.get("id") == element_id), None)
+        if btn is None:
+            return None
+        affirmative = self._match_button([btn], self._CANCEL_PATTERNS) is None
+        save_risk = affirmative and self._popup_save_risk(popup, btn)
+        unread = self._unread_answer(popup, btn)
+        if not (save_risk or unread):
+            return None
+        popup["action_requested"] = "press"
+        return {
+            "popup": popup, "action": "press", "button": btn,
+            "fallback_vkey": None, "save_risk": True,
+            "unread_question": unread, "done": False,
+        }
+
+    def popup_changed(self, popup: Dict[str, Any]) -> str | None:
+        """Why *popup* (a popup read) is no longer the one on top, or None.
+
+        A cheap check, no popup re-read: the same window ID is topmost, with
+        the same title. For a press planned before asking the user.
+        """
+        popup_id = popup["window_id"]
+        try:
+            title = str(getattr(self._find_window(popup_id), "Text", ""))
+            same = (self._top_popup_id() == popup_id
+                    and title.strip() == str(popup.get("title", "")).strip())
+        except Exception:
+            same = False
+        if same:
+            return None
+        return (f"The popup {popup_id} changed before it was acted on. "
+                "Nothing was pressed; read it again.")
+
+    def apply_popup_plan(
+        self, plan: Dict[str, Any], recheck: bool = False,
+    ) -> Dict[str, Any]:
+        """Press what plan_popup_action chose and return handle_popup's result.
+
+        With *recheck*, refuse unless the planned popup is still the topmost
+        window with the same title (a cheap check, no popup re-read): use it
+        when time has passed since the plan, e.g. for a user confirmation.
+        """
+        popup = plan["popup"]
+        if plan.get("done"):
+            return popup
+        self._require_session()
+        action = plan["action"]
+        btn = plan.get("button")
+        fallback_vkey = plan.get("fallback_vkey")
+        popup_id = popup["window_id"]
+
+        if recheck:
+            changed = self.popup_changed(popup)
+            if changed is not None:
+                popup["action"] = "error"
+                popup["error"] = changed
+                return popup
+
+        # Press the button or send fallback VKey
+        if btn is not None:
+            try:
+                self._find_element(btn["id"]).press()
+            except Exception as e:
+                popup["action"] = "error"
+                popup["error"] = f"Failed to press button: {e}"
+                return popup
+            popup["action"] = action + "ed" if action != "press" else "pressed"
+            popup["button_pressed"] = btn.get("text") or btn.get("tooltip")
+        else:
+            # Fallback: send VKey to the popup window
+            try:
+                self._find_window(popup_id).sendVKey(fallback_vkey)
+            except Exception as e:
+                popup["action"] = "error"
+                popup["error"] = f"Failed to send key: {e}"
+                return popup
+            popup["action"] = action + "ed"
+            popup["button_pressed"] = (
+                "Enter (fallback)" if fallback_vkey == 0 else "F12 (fallback)"
+            )
+
+        # The popup that was acted on is gone, so its element IDs are dead
+        # weight. Keep the trail of what it said and which values were
+        # accepted: changeable inputs only, not read-only description fields.
+        inputs = {
+            (el.get("name") or el.get("id", "")): self._mask_field_value(
+                el.get("id", ""), el["text"],
+            )
+            for el in popup.pop("interactive_elements", [])
+            if el.get("type") in self._PREFILL_TYPES
+            and el.get("changeable")
+            and el.get("text")
+        }
+        if inputs:
+            popup["inputs"] = inputs
+        for key in ("buttons", "has_inputs", "recommended_action",
+                    "safe_auto_action", "prefilled_inputs", "notice"):
+            popup.pop(key, None)
+
+        # Return updated screen state after the action. A follow-up popup is
+        # reported in full as popup_after, so the digest would only repeat it.
+        try:
+            popup["screen"] = self.get_screen_info(include_popup=False)
+        except Exception:
+            pass
+
+        try:
+            popup_after = self.get_popup_window()
+            popup["popup_closed"] = not popup_after.get("popup_exists", False)
+            if not popup["popup_closed"]:
+                # A follow-up popup is the new state: that one stays complete.
+                popup["popup_after"] = popup_after
+                if btn is None and self._same_popup(popup, popup_after):
+                    # Live (Ja / Nein / Abbrechen): Enter left the popup as
+                    # it was, and the result said "confirmed".
+                    key = "Enter" if fallback_vkey == 0 else "F12"
+                    popup["action"] = "no_effect"
+                    popup["note"] = (
+                        f"{key} changed nothing: the popup is still open. "
+                        "Press the answer you mean with action='press'."
+                    )
+        except Exception:
+            pass
+
+        return popup
+
+    @staticmethod
+    def _same_popup(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+        """The same window, title and status message: nothing happened."""
+        return all(before.get(key, "") == after.get(key, "")
+                   for key in ("window_id", "title", "message"))
+
+    # =========================================================================
+    # Toolbar Discovery
+    # =========================================================================
+
+    def get_toolbar_buttons(self, window_id: str = "wnd[0]") -> Dict[str, Any]:
+        """
+        List all toolbar buttons on a window's application toolbar.
+
+        Reads buttons from tbar[0] (system toolbar) and tbar[1] (application
+        toolbar).  Returns button IDs, text, tooltip, and enabled state.
+
+        Args:
+            window_id: Window ID (default "wnd[0]")
+
+        Returns:
+            Dict with toolbar button info
+        """
+        self._require_session()
+
+        normalized_window_id = self._validate_window_id(window_id)
+        toolbars: Dict[str, list] = {}
+        for tbar_idx, tbar_name in [(0, "system_toolbar"), (1, "application_toolbar")]:
+            buttons = []
+            try:
+                tbar = self._find_element(f"{normalized_window_id}/tbar[{tbar_idx}]")
+                for i in range(tbar.Children.Count):
+                    btn = tbar.Children(i)
+                    btype = getattr(btn, 'Type', '')
+                    if btype in ('GuiButton',):
+                        buttons.append({
+                            "id": self._normalize_element_id(btn.Id),
+                            "text": getattr(btn, 'Text', '').strip(),
+                            "tooltip": getattr(btn, 'Tooltip', '').strip(),
+                            "enabled": getattr(btn, 'Changeable', True) is not False,
+                        })
+            except Exception:
+                pass
+            if buttons:
+                toolbars[tbar_name] = buttons
+
+        return {
+            "window_id": normalized_window_id,
+            "toolbars": toolbars,
+        }
+
+    # =========================================================================
+    # Shell Content Reading
+    # =========================================================================
+
+    def read_shell_content(self, shell_id: str) -> Dict[str, Any]:
+        """
+        Read content from a GuiShell subtype (HTMLViewer, etc.).
+
+        Attempts to extract useful content based on the shell's SubType.
+        An HTMLViewer is read through BrowserHandle when it hosts the
+        Internet Explorer control; other shells fall back to the Text
+        property.
+
+        Args:
+            shell_id: SAP GUI shell element ID
+
+        Returns:
+            Dict with shell content and metadata
+        """
+        self._require_session()
+
+        try:
+            shell = self._find_element(shell_id)
+            shell_type = getattr(shell, 'Type', '')
+            sub_type = getattr(shell, 'SubType', '')
+
+            result: Dict[str, Any] = {
+                "shell_id": shell_id,
+                "type": shell_type,
+                "sub_type": sub_type,
+            }
+
+            if sub_type == "HTMLViewer":
+                # Its Text is only the ProgID ("SAP.HTMLControl.1").
+                self._read_html_viewer(shell, result)
+                return result
+
+            # Generic fallback: Text property
+            try:
+                text = getattr(shell, 'Text', None)
+                if text is not None:
+                    result["text"] = str(text)[:5000]
+            except Exception:
+                pass
+
+            return result
+        except Exception as e:
+            return self._error_result(
+                {"shell_id": shell_id},
+                e,
+                "Could not read shell content",
+            )
+
+    _HTML_NOT_READABLE = {
+        "Edge": (
+            "The page content of this HTML viewer is not readable through SAP "
+            "GUI Scripting: it runs the Edge (WebView2) browser control, which "
+            "gives scripts no access to the page."
+        ),
+        "other": "The page content of this HTML viewer could not be read.",
+    }
+    _F1_TECH_HINT = (
+        " For F1 help in the Performance Assistant, its toolbar's Technical "
+        "Information button (TECH) opens a readable dialog with the table "
+        "and field names."
+    )
+
+    def _read_html_viewer(self, shell, result: Dict[str, Any]) -> None:
+        """Page text of a GuiHTMLViewer, or a note saying why there is none.
+
+        GetBrowserControlType (SAP GUI 7.70+; the guide misspells it
+        GetBrowerControlType): 0 = Internet Explorer, 1 = Edge. Only the IE
+        control has a BrowserHandle (documented); live on SAP GUI 8.10 with
+        Edge, BrowserHandle is None and the page is out of reach.
+        """
+        try:
+            control = int(shell.GetBrowserControlType())
+        except Exception:
+            control = 0  # before 7.70 the IE control was the only one
+        result["browser_control"] = {0: "Internet Explorer", 1: "Edge"}.get(
+            control, str(control)
+        )
+        if control == 0:
+            try:
+                document = shell.BrowserHandle.Document
+                result["url"] = str(document.URL)
+                result["text"] = str(document.body.innerText)[:5000]
+                return
+            except Exception as e:
+                logger.debug("HTML viewer document not readable: %s", e)
+        reason = self._HTML_NOT_READABLE.get(
+            result["browser_control"], self._HTML_NOT_READABLE["other"]
+        )
+        result["note"] = reason + self._F1_TECH_HINT
+
+    # =========================================================================
+    # Classic List Reading
+    # =========================================================================
+
+    # ABAP list colours (FORMAT COLOR). 0 and 2 are the plain background /
+    # normal text and carry no meaning worth reporting.
+    _LIST_COLORS = {
+        1: "heading", 3: "total", 4: "key",
+        5: "positive", 6: "negative", 7: "group",
+    }
+    _LIST_CELL_RE = re.compile(r"/([a-z]+)\[(\d+),(\d+)\]$")
+
+    def read_list(self, window_id: str = "wnd[0]", max_lines: int = 200,
+                  scroll_to: int = -1, with_ids: bool = False) -> Dict[str, Any]:
+        """
+        Read a classic ABAP list (WRITE output) as lines of text.
+
+        A classic list (report output, program SAPMSSY0; also many F4 hit
+        lists) has no table object: every word is a GuiLabel named
+        ``lbl[col,row]``, over 1,000 on one page of an SE16 list (discovery
+        leaves them out); this reassembles them into the lines a user sees.
+
+        Args:
+            window_id: Window holding the list (a popup for F4 hit lists)
+            max_lines: Maximum number of lines to return
+            scroll_to: Vertical scrollbar position to move to first; -1 reads
+                the page that is currently shown
+            with_ids: Also return, per line, the ID of its first label (to set
+                the focus on a line before F2 / double-click)
+
+        Returns:
+            Dict with the lines of the visible page, colours of the lines that
+            have a semantic one, and the scroll state for paging
+        """
+        self._require_session()
+
+        try:
+            window_id = self._validate_window_id(window_id)
+            usr_id = f"{window_id}/usr"
+            usr = self._session.findById(usr_id)
+
+            if scroll_to >= 0:
+                usr.VerticalScrollbar.Position = scroll_to
+                # Scrolling re-renders the page: the old reference is stale.
+                usr = self._session.findById(usr_id)
+
+            rows: Dict[int, list] = {}
+            for child_id, read in self._list_children(usr_id, usr):
+                match = self._LIST_CELL_RE.search(child_id)
+                if not match:
+                    continue
+                kind, col, row = match.group(1), int(match.group(2)), int(match.group(3))
+                if kind == "chk":
+                    text = "[x]" if read("Selected") else "[ ]"
+                    color = None
+                else:
+                    text = read("Text")
+                    color = self._LIST_COLORS.get(
+                        read("ColorIndex")
+                    ) if kind == "lbl" else None
+                rows.setdefault(row, []).append((col, text, color, child_id))
+
+            if not rows:
+                return {
+                    "window": window_id,
+                    "is_list": False,
+                    "lines": [],
+                    "note": (
+                        "No list labels on this screen. For ALV grids and table "
+                        "controls use read_table."
+                    ),
+                }
+
+            first_row = min(rows)
+            last_row = min(max(rows), first_row + max(max_lines, 1) - 1)
+            lines: List[str] = []
+            colors: Dict[str, List[str]] = {}
+            ids: Dict[str, str] = {}
+            for row in range(first_row, last_row + 1):
+                line = ""
+                row_colors: List[str] = []
+                cells = sorted(rows.get(row, []), key=lambda cell: cell[0])
+                for col, text, color, _cell_id in cells:
+                    line = line.ljust(col) + text
+                    if color and color not in row_colors:
+                        row_colors.append(color)
+                lines.append(line.rstrip())
+                if row_colors:
+                    colors[str(row)] = row_colors
+                if with_ids and cells:
+                    ids[str(row)] = self._normalize_element_id(cells[0][3])
+
+            result: Dict[str, Any] = {
+                "window": window_id,
+                "is_list": True,
+                "first_row": first_row,
+                "lines": lines,
+            }
+            if colors:
+                result["colors"] = colors
+            if with_ids:
+                result["line_ids"] = ids
+            if max(rows) > last_row:
+                result["truncated"] = True
+            scroll = self._list_scroll_state(usr)
+            if scroll:
+                result["scroll"] = scroll
+            return result
+
+        except Exception as e:
+            return self._error_result({"window": window_id}, e, "Could not read list")
+
+    def _list_children(self, usr_id: str, usr):
+        """(id, read) for each child of a list's user area.
+
+        read(name) gives Text (str), ColorIndex (int) or Selected (bool): from
+        one GetObjectTree call, or over COM on SAP GUI before 7.70 PL3.
+        Selected is always read over COM: the tree must not carry it
+        (_OBJECT_TREE_UNSAFE_PROPS), and only checkboxes ask for it.
+        """
+        tree = self._object_tree(usr_id, ["Id", "Text", "ColorIndex"], site="list")
+        if tree is not None:
+            for node in tree.get("children") or []:
+                props = node.get("properties") or {}
+
+                def read(name, props=props):
+                    value = props.get(name, "")
+                    if name == "Selected":
+                        return bool(self._selected(props.get("Id", "")))
+                    if name == "ColorIndex":
+                        return int(value) if value.lstrip("-").isdigit() else 0
+                    return value
+                yield props.get("Id", ""), read
+            return
+
+        children = usr.Children  # once: see _enumerate_elements
+        for i in range(children.Count):
+            child = children(i)
+
+            def read(name, child=child):
+                default = {"Selected": False, "ColorIndex": 0}.get(name, "")
+                value = self._list_prop(child, name, default)
+                return str(value) if name == "Text" else value
+            yield child.Id, read
+
+    @staticmethod
+    def _list_prop(obj, name: str, default):
+        """Read a COM property that may be unsupported on this element."""
+        try:
+            return getattr(obj, name)
+        except Exception:
+            return default
+
+    def _list_scroll_state(self, usr) -> Dict[str, Any]:
+        """Vertical (and, when the list is wider than the window, horizontal)
+        scrollbar state, so the caller can page with scroll_to."""
+        state: Dict[str, Any] = {}
+        for key, attr in (("vertical", "VerticalScrollbar"),
+                          ("horizontal", "HorizontalScrollbar")):
+            try:
+                bar = getattr(usr, attr)
+                maximum = bar.Maximum
+                if maximum > 0:
+                    state[key] = {
+                        "position": bar.Position,
+                        "maximum": maximum,
+                        "page_size": bar.PageSize,
+                    }
+            except Exception:
+                continue
+        return state
+
+    # =========================================================================
+    # Screen Element Discovery
+    # =========================================================================
+
+    def get_screen_elements(self, container_id: str = "wnd[0]/usr",
+                            max_depth: int = 3,
+                            type_filter: str = "",
+                            changeable_only: bool = False,
+                            expand_tables: bool = False,
+                            lists: List[Dict[str, Any]] | None = None,
+                            ) -> List[ScreenElement]:
+        """
+        Enumerate all elements on the current screen.
+
+        Useful for discovering field IDs when automating a new transaction.
+
+        Args:
+            container_id: Starting container (default: main user area). A
+                bare window ("wnd[0]") lists its top-level children, incl.
+                docking containers that live beside the user area.
+            max_depth: Maximum recursion depth
+            type_filter: Comma-separated SAP element types to include
+                (e.g. "GuiTextField,GuiCTextField"). Empty = all types.
+            changeable_only: If True, only return editable/input elements
+            expand_tables: If True, also list every visible cell of a
+                GuiTableControl and of a classic list. Off by default: an
+                empty two-column table is 76 elements and one page of an SE16
+                list over 1,100, while read_table / read_list describe them
+                far more compactly.
+            lists: If given, receives one summary per container whose
+                classic-list cells were left out: container, cells, rows.
+
+        Returns:
+            List of ScreenElement objects
+        """
+        self._require_session()
+
+        type_filter_set = None
+        if type_filter:
+            type_filter_set = {t.strip() for t in type_filter.split(",") if t.strip()}
+
+        try:
+            root_id = self._validate_container_id(container_id)
+            list_rows: Dict[str, List[int]] = {}
+            options = dict(
+                type_filter_set=type_filter_set,
+                changeable_only=changeable_only,
+                expand_tables=expand_tables,
+                list_rows=list_rows,
+            )
+            tree = self._object_tree(root_id, self._DISCOVERY_PROPS, site="elements")
+            if tree is not None:
+                elements = self._elements_from_tree(tree, max_depth, **options)
+            else:
+                container = self._session.findById(root_id)
+                elements = self._enumerate_elements(container, max_depth, **options)
+            if lists is not None:
+                for list_container, rows in list_rows.items():
+                    lists.append({
+                        "container": list_container,
+                        "cells": len(rows),
+                        "rows": len(set(rows)),
+                    })
+            return elements
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "Failed to enumerate elements in %s: %s",
+                container_id,
+                e,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            raise SAPGUIError(f"Failed to enumerate elements in '{container_id}'")
+
+    def get_docking_containers(self, window_id: str = "wnd[0]") -> List[str]:
+        """List a window's docking containers as short IDs.
+
+        Docking containers (``wnd[0]/shellcont``, ``wnd[0]/shellcont[1]``) are
+        siblings of the user area, so discovery under ``wnd[0]/usr`` never
+        reaches them. They hold the dialog-structure tree of view clusters
+        (SM34, most IMG activities) and the SE80 repository tree.
+        """
+        self._require_session()
+
+        try:
+            window = self._find_window(window_id)
+            containers = []
+            for i in range(window.Children.Count):
+                child_id = self._normalize_element_id(window.Children(i).Id)
+                if child_id.rsplit("/", 1)[-1].startswith("shellcont"):
+                    containers.append(child_id)
+            return containers
+        except Exception as e:
+            logger.debug("Could not list docking containers of %s: %s", window_id, e)
+            return []
+
+    # Key / Value are a dropdown's selection ("" for every other element).
+    _DISCOVERY_PROPS = ["Id", "Type", "Name", "Text", "Changeable", "Key", "Value"]
+
+    @staticmethod
+    def _apply_combobox_selection(element: ScreenElement, key, value) -> None:
+        """Give a dropdown its selected key, and the entry's text as text.
+
+        A dropdown's Text is padded to 200+ characters and, with SAP GUI's
+        "show keys" option, prefixed with the key ("1 DD.MM.YYYY"); Value is
+        the entry's text alone. The empty entry's key is a single space.
+        """
+        element.key = str(key or "").strip()
+        element.text = (str(value or "").strip() or element.text.strip())[:200]
+
+    def _elements_from_tree(self, node: Dict[str, Any], max_depth: int,
+                            current_depth: int = 0,
+                            type_filter_set: set = None,
+                            changeable_only: bool = False,
+                            expand_tables: bool = False,
+                            list_rows: Dict[str, List[int]] | None = None,
+                            ) -> List[ScreenElement]:
+        """_enumerate_elements over a GetObjectTree node: same rules, no COM
+        but the Selected of each radio button and checkbox listed."""
+        elements = []
+        if current_depth >= max_depth:
+            return elements
+
+        for child in node.get("children") or []:
+            props = child.get("properties") or {}
+            child_id = self._normalize_element_id(props.get("Id", ""))
+            if not expand_tables and self._tally_list_cell(child_id, list_rows):
+                continue
+
+            element = ScreenElement(
+                id=child_id,
+                type=props.get("Type", ""),
+                name=props.get("Name", ""),
+                text=props.get("Text", "")[:200],
+                changeable=props.get("Changeable") == "true",
+            )
+            if element.type == "GuiComboBox":
+                self._apply_combobox_selection(
+                    element, props.get("Key"), props.get("Value"))
+            if self._wanted(element, type_filter_set, changeable_only):
+                if element.type in self._SELECTABLE_TYPES:
+                    element.selected = self._selected(child_id)
+                elements.append(element)
+            if element.type == "GuiTableControl" and not expand_tables:
+                continue
+            elements.extend(self._elements_from_tree(
+                child, max_depth, current_depth + 1,
+                type_filter_set=type_filter_set,
+                changeable_only=changeable_only,
+                expand_tables=expand_tables,
+                list_rows=list_rows,
+            ))
+        return elements
+
+    def _tally_list_cell(self, child_id: str,
+                         list_rows: Dict[str, List[int]] | None) -> bool:
+        """True for a classic-list cell (lbl[col,row]), counting its row.
+
+        A classic list has no table object: every word is its own cell, over
+        1,000 on one page. read_list shows them as lines, so discovery counts
+        them instead of listing them.
+        """
+        cell = self._LIST_CELL_RE.search(child_id)
+        if not cell:
+            return False
+        if list_rows is not None:
+            list_rows.setdefault(child_id[:cell.start()], []).append(
+                int(cell.group(3))
+            )
+        return True
+
+    @staticmethod
+    def _wanted(element: ScreenElement, type_filter_set: set | None,
+                changeable_only: bool) -> bool:
+        """Apply discovery's filters (containers are recursed regardless)."""
+        if type_filter_set and element.type not in type_filter_set:
+            return False
+        if changeable_only and not element.changeable:
+            return False
+        return True
+
+    def _enumerate_elements(self, container, max_depth: int,
+                            current_depth: int = 0,
+                            type_filter_set: set = None,
+                            changeable_only: bool = False,
+                            expand_tables: bool = False,
+                            list_rows: Dict[str, List[int]] | None = None,
+                            ) -> List[ScreenElement]:
+        """Recursively enumerate screen elements over COM.
+
+        The fallback when GetObjectTree is not available (SAP GUI before
+        7.70 PL3). Classic-list cells are left out unless expand_tables;
+        list_rows, when given, collects their row numbers per parent
+        container.
+        """
+        elements = []
+
+        if current_depth >= max_depth:
+            return elements
+
+        def prop(obj, name, default):
+            # COM raises more than AttributeError for an unsupported property
+            # (GuiTitlebar.Changeable -> IndexError), which getattr's default
+            # does not absorb; one such child must not hide its siblings.
+            try:
+                return getattr(obj, name)
+            except Exception:
+                return default
+
+        try:
+            # Fetch the collection once: each container.Children access builds
+            # it anew, which made one SE16 list page take 13 s instead of 1.4.
+            children = container.Children
+            for i in range(children.Count):
+                child = children(i)
+                child_id = self._normalize_element_id(child.Id)
+
+                # A list cell's other properties are never read: skipping them
+                # is most of the cost of a list page.
+                if not expand_tables and self._tally_list_cell(child_id, list_rows):
+                    continue
+
+                element = ScreenElement(
+                    id=child_id,
+                    type=child.Type,
+                    name=prop(child, 'Name', ''),
+                    text=str(prop(child, 'Text', ''))[:200],
+                    changeable=prop(child, 'Changeable', False),
+                )
+                if element.type == "GuiComboBox":
+                    self._apply_combobox_selection(
+                        element, prop(child, 'Key', ''), prop(child, 'Value', ''))
+
+                # Apply filters — but always recurse into containers
+                if self._wanted(element, type_filter_set, changeable_only):
+                    if element.type in self._SELECTABLE_TYPES:
+                        element.selected = self._selected(element=child)
+                    elements.append(element)
+
+                # A table control stays ONE element: its cells are read with
+                # the table tools, not dumped one element per cell.
+                if element.type == "GuiTableControl" and not expand_tables:
+                    continue
+
+                # Recurse into containers regardless of filters. Not hasattr():
+                # on a status-bar pane, Children raises a COM error that is no
+                # AttributeError, which ended this loop and dropped panes 1-6.
+                grandchildren = prop(child, 'Children', None)
+                if grandchildren is not None and prop(grandchildren, 'Count', 0) > 0:
+                    child_elements = self._enumerate_elements(
+                        child, max_depth, current_depth + 1,
+                        type_filter_set=type_filter_set,
+                        changeable_only=changeable_only,
+                        expand_tables=expand_tables,
+                        list_rows=list_rows,
+                    )
+                    elements.extend(child_elements)
+
+        except Exception as e:
+            logger.debug(f"Error enumerating at depth {current_depth}: {e}")
+
+        return elements
+
+    # =========================================================================
+    # Screenshot & Visual
+    # =========================================================================
+
+    def _find_topmost_window(self) -> str:
+        """Find the topmost SAP GUI window (highest wnd index that exists).
+
+        Popups appear as wnd[1], wnd[2], etc. This returns the topmost
+        window so screenshots and screen reads capture what the user sees.
+
+        Tries Session.ActiveWindow first (faster), falls back to loop.
+        """
+        try:
+            active = self._session.ActiveWindow
+            if active is not None:
+                return self._normalize_window_id(active.Id)
+        except Exception:
+            pass
+
+        topmost = "wnd[0]"
+        for i in range(1, 10):
+            try:
+                self._session.findById(f"wnd[{i}]")
+                topmost = f"wnd[{i}]"
+            except Exception:
+                break
+        return topmost
+
+    def take_screenshot(self, filepath: str = None) -> Dict[str, Any]:
+        """
+        Take a screenshot of the current SAP window.
+
+        Args:
+            filepath: Optional file path. If not provided, returns base64 data.
+
+        Returns:
+            Dict with filepath or base64 encoded image data
+        """
+        self._require_session()
+
+        import os
+        import tempfile
+
+        temp_filepath = None
+        try:
+            if filepath is None:
+                temp_file = tempfile.NamedTemporaryFile(
+                    delete=False,
+                    prefix="sap_screenshot_",
+                    suffix=".png",
+                )
+                temp_filepath = temp_file.name
+                temp_file.close()
+                filepath = temp_filepath
+                return_base64 = True
+            else:
+                return_base64 = False
+
+            # Find the topmost window (popups are wnd[1], wnd[2], etc.)
+            window_id = self._find_topmost_window()
+            window = self._find_window(window_id)
+            window.HardCopy(filepath, _HARDCOPY_PNG)
+
+            # Optimize image size with Pillow if available
+            self._optimize_screenshot(filepath)
+
+            if return_base64:
+                import base64
+                with open(filepath, "rb") as f:
+                    data = base64.b64encode(f.read()).decode()
+                os.remove(filepath)
+                return {
+                    "format": "png",
+                    "encoding": "base64",
+                    "window": window_id,
+                    "data": data,
+                }
+            else:
+                return {
+                    "format": "png",
+                    "filepath": filepath,
+                    "window": window_id,
+                }
+
+        except Exception as e:
+            if temp_filepath and os.path.exists(temp_filepath):
+                os.remove(temp_filepath)
+            return self._error_result({}, e, "Could not capture screenshot")
+
+    def save_screenshot(self, save_path: str, inline: bool = True) -> Dict[str, Any]:
+        """
+        Save a screenshot of the current SAP window to a PNG file.
+
+        The file keeps the full resolution SAP GUI renders (the inline image
+        is downscaled to 1920px), which is what a document needs. An existing
+        file is never overwritten.
+
+        Args:
+            save_path: Target file; must end in ".png" and its directory must
+                exist. Relative paths resolve against the server's working
+                directory.
+            inline: Also return the (downscaled) image as base64 ``data``.
+
+        Returns:
+            Dict with the absolute filepath, pixel size, window and, when
+            *inline* is set, the base64 image data
+        """
+        self._require_session()
+
+        import base64
+        import os
+        import shutil
+        import tempfile
+
+        temp_filepath = None
+        try:
+            target = self._resolve_screenshot_path(save_path)
+
+            window_id = self._find_topmost_window()
+            self._find_window(window_id).HardCopy(target, _HARDCOPY_PNG)
+            if not os.path.isfile(target):
+                raise SAPGUIError("SAP GUI did not write the screenshot file")
+
+            result: Dict[str, Any] = {
+                "format": "png",
+                "filepath": target,
+                "window": window_id,
+                "size_bytes": os.path.getsize(target),
+            }
+            size = self._png_size(target)
+            if size is not None:
+                result["width"], result["height"] = size
+
+            if inline:
+                # Optimize a copy: the saved file stays at full resolution.
+                temp_file = tempfile.NamedTemporaryFile(
+                    delete=False,
+                    prefix="sap_screenshot_",
+                    suffix=".png",
+                )
+                temp_filepath = temp_file.name
+                temp_file.close()
+                shutil.copyfile(target, temp_filepath)
+                self._optimize_screenshot(temp_filepath)
+                with open(temp_filepath, "rb") as f:
+                    result["data"] = base64.b64encode(f.read()).decode()
+
+            return result
+
+        except Exception as e:
+            return self._error_result({}, e, "Could not save screenshot")
+        finally:
+            if temp_filepath and os.path.exists(temp_filepath):
+                os.remove(temp_filepath)
+
+    def _resolve_screenshot_path(self, save_path: Any) -> str:
+        """Validate a screenshot target and return it as an absolute path."""
+        import os
+
+        if not isinstance(save_path, str) or not save_path.strip():
+            raise ValueError("save_path must be a file path ending in '.png'")
+
+        target = os.path.abspath(os.path.expanduser(save_path.strip()))
+        if not target.lower().endswith(".png"):
+            raise ValueError(f"save_path must end in '.png': {save_path!r}")
+        if not os.path.isdir(os.path.dirname(target)):
+            raise ValueError(
+                f"Directory does not exist: {os.path.dirname(target)!r}"
+            )
+        if os.path.exists(target):
+            raise ValueError(
+                f"File already exists: {target!r}. Screenshots never "
+                "overwrite a file; choose another name."
+            )
+        return target
+
+    @staticmethod
+    def _png_size(filepath: str) -> tuple[int, int] | None:
+        """Read (width, height) from a PNG header without needing Pillow."""
+        import struct
+
+        try:
+            with open(filepath, "rb") as f:
+                header = f.read(24)
+        except OSError:
+            return None
+        if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
+        width, height = struct.unpack(">II", header[16:24])
+        return width, height
+
+    def _optimize_screenshot(self, filepath: str) -> None:
+        """
+        Optimize screenshot file size using Pillow if available.
+
+        Resizes large images and applies PNG optimization to significantly
+        reduce file size (typically 70-90% reduction).
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            logger.debug("Pillow not installed, skipping screenshot optimization")
+            return
+
+        try:
+            img = Image.open(filepath)
+
+            # Downscale if image is very large (> 1920px wide)
+            max_width = 1920
+            if img.width > max_width:
+                ratio = max_width / img.width
+                new_size = (max_width, int(img.height * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+
+            # Convert RGBA to RGB if no transparency (smaller file)
+            if img.mode == "RGBA":
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])
+                img = background
+
+            # Save with optimization
+            img.save(filepath, "PNG", optimize=True)
+        except Exception as e:
+            logger.debug(f"Screenshot optimization failed (using original): {e}")

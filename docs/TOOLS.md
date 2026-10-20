@@ -1,0 +1,244 @@
+# Tool Catalog
+
+`mcp-sap-gui` currently exposes **60 MCP tools**.
+
+Two practical rules:
+
+- Start with discovery instead of guessing IDs.
+- Start table work with `sap_read_table`, then branch into ALV- or TableControl-specific tools as needed.
+
+ID handling:
+
+- Pass normal SAP GUI IDs such as `wnd[0]/usr/...`, `wnd[0]/tbar[1]/btn[8]`, or `wnd[0]/mbar/menu[3]/menu[0]`.
+- Full session paths such as `/app/con[0]/ses[0]/wnd[0]/usr/...` are accepted and normalized automatically.
+- Docking containers sit beside the user area, not inside it: the dialog-structure tree of a view cluster (SM34, most IMG activities) is under `wnd[0]/shellcont/...`. `sap_get_screen_elements` lists them as `docking_containers`; pass `container_id="wnd[0]"` with `max_depth=1` to see all top-level areas of a window. Switch views in such a tree with `sap_double_click_tree_item(tree_id, node_key, "Column1")`; `sap_double_click_tree_node` does not navigate there.
+- Malformed IDs are rejected before they reach SAP GUI scripting.
+
+## Policy Profiles
+
+Every tool is tagged `read` or `write`. Three profiles control which tools are visible:
+
+| Profile | Tags | What the agent can do |
+|---|---|---|
+| `exploration` | `read` | Observe only: inspect screens, read tables, take screenshots. Cannot interact or navigate. |
+| `operator` | `read`, `write` | Normal SAP work: navigate transactions, fill fields, press buttons. The built-in transaction policy still applies, and save-key confirmation may still prompt the user. |
+| `full` | `read`, `write` | All tools. Default. |
+
+Set the default profile at startup with `--profile operator`, or switch per-session with `sap_set_policy_profile`. A session can only restrict the profile, never widen it beyond the server's `--profile` floor.
+
+## Confirmation Points
+
+A confirmation point is a category of write operations that requires blocking user approval (MCP elicitation) before the server executes it. The gate is server-side middleware, so it holds regardless of what the agent does, including inside the `--code-mode` sandbox.
+
+| Point | Gated tools |
+|---|---|
+| `save` | `sap_send_key("F11")` / `sap_send_key("Save")` and `sap_press_button` on the Save toolbar button (`wnd[0]/tbar[0]/btn[11]`). On popups (`sap_handle_popup`, or `sap_press_button` on a popup button): a Save button, Yes/OK on a popup about saving, and any answer but Cancel to a popup question the server cannot read. Always on, cannot be turned off |
+| `transactions` | `sap_execute_transaction` |
+| `batch_fields` | `sap_set_batch_fields` |
+| `field_writes` | `sap_set_field`, `sap_modify_cell`, `sap_set_textedit`, `sap_select_checkbox`, `sap_select_radio_button`, `sap_select_combobox_entry` |
+| `all_writes` | Every `write`-tagged tool. Deliberately strict and noisy: many write tools only select, scroll or navigate. Under `all_writes`, `sap_send_key("F11")` prompts twice — once for the category, once for the unchanged save gate |
+| `attach` | `sap_connect_existing`: the user picks the SAP session in a choice dialog listing every open session (system, session number, client, user, transaction, window title), unless the call names a system with exactly one open session. Declining attaches nothing; a client without dialogs gets an error telling the agent to ask in the chat and pass `system` |
+
+Activate points per session with `sap_set_confirmation_points`, or for every session with `--confirm POINT [POINT ...]`. Adding a point is silent; removing a session point asks the user first and a declined removal keeps it. Points set by `--confirm` and the `save` point can never be removed.
+
+An accepted call's result carries `confirmed_by_user: true`, so the agent, which never sees the prompt, can tell an approved write from an ungated one. Declining a confirmation returns an error and nothing is executed. Clients without elicitation support fail closed — the gated call errors rather than running unconfirmed, matching the save gate. Removal fails closed on those clients too, so a point activated there cannot be turned off again and blocks that whole category for the rest of the session. Confirmation outcomes (`accepted`, `declined`, `unsupported_client`) are written to the audit log.
+
+**The client has to show the dialog.** Confirmations (and the `save` prompt) are MCP elicitation requests. The Claude Code CLI shows them. The Claude Code desktop app (Code tab, tested 2026-10-19 with its bundled Claude Code 2.1.299) answered every request with "decline" within milliseconds and showed nothing, in auto and in manual permission mode: there, nothing gated can be approved, and saves through the server are refused. An answer faster than a person can give one (under 250 ms) came from the client: a "no" still counts and the error says that no dialog was shown; a "yes" is refused, because no person approved it. The audit line has `no_dialog: true` next to `elapsed_ms`, and `client_answer: "accept"` for a refused yes.
+
+Points are scoped to the MCP session, not the SAP connection: they survive `sap_disconnect` and a later reconnect.
+
+Known gap: menu paths (System → Save) and ALV / application-toolbar Save buttons are not mapped to the `save` point, because those IDs are positional and locale-dependent.
+
+## Connection
+
+Preferred usage: use `sap_connect_existing` when the user is already logged in to SAP. Use `sap_connect` mainly for SSO flows or to open the SAP login screen before the user completes manual login.
+
+| Tool | Description |
+|------|-------------|
+| `sap_connect` | Connect to an SAP system by SAP Logon entry name. Credentials resolved from `.env` file — passwords never appear in MCP |
+| `sap_connect_existing` | Attach to an already open SAP session (SAP Logon or SAP Business Client), by `connection_index` / `session_index` or by `system` (`DEV` or `DEV/100`) when the user named it: one open session on it is attached, several or none return an error listing what is open. The response says how the session was chosen (`chosen_by`), and the audit log records an `attach` event |
+| `sap_list_connections` | List all currently open SAP connections and sessions, incl. SAP Business Client; reports `host` and `scripting_disabled`, and per session its system, client, user, transaction, `session_number` and window `title` |
+| `sap_get_session_info` | Get current session metadata like system, client, user, transaction, and screen, plus the SAP GUI release (`sap_gui_version`, e.g. `8.10 PL0`) and whether the server allows only read-only scripting (`scripting_read_only`) |
+| `sap_disconnect` | Disconnect from the current SAP session (detaches attached sessions, closes owned sessions) |
+| `sap_set_policy_profile` | Switch the active policy profile for this session (exploration, operator, full); capped by the server `--profile` floor |
+| `sap_set_confirmation_points` | Choose which write categories need blocking user approval for this session (see [Confirmation Points](#confirmation-points)) |
+
+## Navigation
+
+| Tool | Description |
+|------|-------------|
+| `sap_execute_transaction` | Execute a transaction code such as `MM03`, `VA01`, or `/SCWM/MON` subject to the active transaction policy (presets and policy file: see the README's Security Considerations). A bare `/n` leaves the current transaction |
+| `sap_send_key` | Send SAP keys such as `Enter`, function keys, `Back`, `Save`, or `Ctrl+F` / `Ctrl+G` / `Ctrl+P`; `F11` / `Save` requires explicit confirmation via elicitation-capable clients. A key the screen does not accept is not sent: the response lists `available_keys` |
+| `sap_get_screen_info` | Read current screen info including transaction, program, screen number, title, status, and active window. `message_has_long_text` / `message_as_popup` appear when set, and so do `subscreens` (the sub-screens on the window as `program:dynnr`, outer first: an RF step, a tab page or a detail area, which `program` / `screen_number` do not show) and `cursor` (the ID of the field the cursor is in; a redisplay without a message, e.g. for an empty required field, moves it). Every action response carries the same screen info |
+
+## Fields And UI Elements
+
+| Tool | Description |
+|------|-------------|
+| `sap_read_field` | Read a field value with metadata. For a dropdown, `value` is the selected entry's text and `key` its key; for a radio button or checkbox, `selected` says whether it is selected |
+| `sap_set_field` | Set a field value. On a dropdown (`cmb`) the value selects the entry by its key or its text |
+| `sap_press_button` | Press a button. On the status bar (`wnd[0]/sbar`) it opens the message's long text, which shows as a list popup (`sap_read_list(window_id="wnd[1]")`) |
+| `sap_select_menu` | Select a menu item or submenu |
+| `sap_select_checkbox` | Select or clear a checkbox |
+| `sap_select_radio_button` | Select a radio button |
+| `sap_select_combobox_entry` | Select a combobox entry by key, visible text, or both as shown with SAP GUI's "show keys" option (`1 DD.MM.YYYY`) |
+| `sap_select_tab` | Select a tab strip tab |
+| `sap_get_combobox_entries` | List combobox entries, with the current key and text |
+| `sap_set_batch_fields` | Set multiple fields in one call, with optional `validate` and `skip_readonly` support for safer form fill. Returns counts and lists only the fields that did not succeed (`verbose=true` lists all). Works on table-control cells via the `cell_id` templates from `sap_read_table(columns_only=true)`, and on dropdowns (key or text) |
+| `sap_read_textedit` | Read a multiline text editor |
+| `sap_set_textedit` | Set a multiline text editor |
+| `sap_set_focus` | Set focus to a screen element |
+
+## Tables And Grids
+
+`sap_read_table` auto-detects whether the control is:
+
+- `GuiGridView` for ALV-style grids
+- `GuiTableControl` for classic SAP table controls
+
+### Shared Table Tools
+
+| Tool | Description |
+|------|-------------|
+| `sap_read_table` | Read rows and columns from a table or grid. With `columns_only=true` a TableControl also reports each column's `cell_type` and a `cell_id` template (`{row}` = zero-based visible row). Columns of a table without rows are flagged `name_is_title`: no cell exists yet to read the technical name from. A TableControl's `total_rows` counts its empty lines too (SM30 pads the view): the read stops at the first empty row and reports its index as `empty_rows_from`, where the data ends. On a TableControl, `start_row` (0 included) scrolls there first; without it the read starts where the table is scrolled now, e.g. after "Position...". An ALV read that cannot scroll (read-only scripting) stops at the rows on screen and reports `unread_from_row` |
+| `sap_select_table_row` | Select a row |
+| `sap_double_click_cell` | Double-click a cell |
+| `sap_modify_cell` | Modify an editable cell. On a TableControl it scrolls to the row first and refuses if the row is still not visible afterwards, instead of writing another row |
+| `sap_set_current_cell` | Set the focused cell |
+| `sap_get_column_info` | Get column names, titles, and metadata (ALV: data type and key flag; table control: cell type and cell ID template) |
+| `sap_get_current_cell` | Get the current focused cell |
+| `sap_select_multiple_rows` | Select multiple rows |
+
+### ALV Grid Tools
+
+| Tool | Description |
+|------|-------------|
+| `sap_get_alv_toolbar` | List ALV toolbar buttons |
+| `sap_press_alv_toolbar_button` | Press an ALV toolbar button. A menu button opens its menu and the response lists `menu_items` (text and function code) |
+| `sap_select_alv_context_menu_item` | Select an ALV context menu item by function code, text or position |
+| `sap_get_cell_info` | Read detailed ALV cell metadata: editable, cell type (checkbox, dropdown, button), error/warning state, F4 help, hotspot |
+| `sap_press_column_header` | Click a column header, typically to sort |
+| `sap_select_all_rows` | Select all ALV rows |
+
+### TableControl Tools
+
+| Tool | Description |
+|------|-------------|
+| `sap_scroll_table_control` | Scroll a classic table control to a row position. `position` is the row SAP actually put at the top, which can differ from the one asked for (`requested_position` and a `note` then say so); cell IDs count visible rows from there |
+| `sap_get_table_control_row_info` | Read row metadata from a classic table control |
+| `sap_select_all_table_control_columns` | Select or clear all column headers in a classic table control |
+
+## Popup, Toolbar, And Shell
+
+| Tool | Description |
+|------|-------------|
+| `sap_get_popup_window` | Read popup title, text, buttons, and classification so the agent can tell confirmation from information, warning, error or input-required dialogs. An F4 hit list is classified `list` (read it with `sap_read_list`), the F4 calendar `date_picker`, the F4 time picker `time_picker` (with its dropdown IDs and the time shown); none is ever auto-handled. SAP's message popup is only auto-confirmed when its icon shows an information message, so a warning in any logon language is not. Radio buttons and checkboxes in `interactive_elements` carry `selected`. Changeable inputs that already hold a value, and changeable radio buttons and checkboxes that are selected, are listed as `prefilled_inputs` with a notice: confirming accepts them as they are. SAP's confirmation popup draws its question in an HTML viewer: with the Internet Explorer browser control its text is in `texts`; with Edge (the default) the popup says `question_readable: false`, and `sap_screenshot` shows the question |
+| `sap_handle_popup` | Read and act on popups in one call, including `confirm`, `cancel`, `press`, and safe `auto` handling with post-action verification. `cancel` presses a Cancel button or F12, never No (on a save prompt No drops the changes). When the Enter or F12 fallback leaves the popup as it was, the result is `action: "no_effect"`. After an action the result keeps the popup's title, texts and entered values and drops its now-dead element IDs |
+| `sap_get_toolbar_buttons` | List standard SAP toolbar buttons |
+| `sap_read_shell_content` | Read content from shell-based controls such as HTML viewers (page text only with the Internet Explorer browser control; the Edge control, e.g. the F1 Performance Assistant, is reported as not readable) |
+| `sap_read_list` | Read a classic ABAP list (`WRITE` output, F4 hit lists) as lines of text, with list colours and paging. One page is ~500 label elements to discovery; this returns the lines |
+
+Every action tool also reports a popup that it opened: `screen.popup` carries the classification, texts, button labels and any `prefilled_inputs`, so the values are visible before the agent decides how to respond.
+
+## Trees
+
+| Tool | Description |
+|------|-------------|
+| `sap_read_tree` | Read nodes, hierarchy, and values from a tree |
+| `sap_expand_tree_node` | Expand a folder node |
+| `sap_collapse_tree_node` | Collapse a folder node |
+| `sap_select_tree_node` | Select a tree node |
+| `sap_double_click_tree_node` | Double-click a tree node |
+| `sap_double_click_tree_item` | Double-click a specific item in a tree row |
+| `sap_click_tree_link` | Click a hyperlink inside a tree row |
+| `sap_find_tree_node_by_path` | Resolve a node key from a path |
+| `sap_search_tree_nodes` | Search tree nodes by text |
+| `sap_get_tree_node_children` | Get direct children of a node, optionally expanding first |
+
+## Discovery
+
+| Tool | Description |
+|------|-------------|
+| `sap_get_screen_elements` | Enumerate screen elements, optionally by container or filter. Reports `docking_containers` when the window has any. A table control is one element, and a classic list is reported under `lists` without its cells (`expand_tables=true` lists the cells of both); a dropdown reports its selected `key` and the entry's text, a radio button or checkbox `selected`; IDs are returned in the short `wnd[0]/...` form |
+| `sap_screenshot` | Capture a screenshot of the active SAP window. `save_path` also writes a full-resolution PNG (never overwrites an existing file) and returns its path and pixel size; `inline=false` skips the image when only the file is needed |
+
+## Preview
+
+| Tool | Description |
+|------|-------------|
+| `sap_preview` | Show the user a read-only preview of the current screen (screenshot, transaction, session, status bar) together with `pending_fields`, the values the agent is about to write. Call it before batch fills or `F11` / Save, or whenever the user asks to see what is about to happen |
+
+`sap_preview` never writes and never saves; it does not replace the `F11` / Save
+confirmation, which stays enforced in `sap_send_key`. Every client receives the
+written summary plus the screenshot as an image block. Clients that support the
+MCP Apps UI extension instead receive a rendered card carrying the screenshot
+and the pending-values table (requires the optional `apps` extra; see
+[Rendered Preview Cards](../README.md#rendered-preview-cards) for offline
+deployments). Values whose field name looks sensitive (`PWD`, `BCODE`,
+`PASSWORD`) are rendered as `***` in both.
+
+## Workflow Guidance
+
+| Tool | Description |
+|------|-------------|
+| `sap_get_workflow_guide` | Return structured, step-by-step guidance for a supported workflow such as `search_help`, `table_export`, or `spro_navigate` |
+
+## Transaction Guidance
+
+| Tool | Description |
+|------|-------------|
+| `sap_get_transaction_guide` | Return a generic, read-first guide for a supported transaction: `/SCWM/MON` (aliases `SCWM/MON`, `warehouse monitor`) or `SM30` for table/view maintenance and view clusters (aliases `SM34`, `table maintenance`, `view cluster`) |
+
+## Recommended Usage Patterns
+
+### New Or Unfamiliar Screen
+
+1. `sap_get_screen_info`
+2. `sap_get_screen_elements`
+3. Then read or set fields based on discovered IDs
+
+### Popup Handling
+
+1. Check `active_window` in tool responses
+2. If it is not `wnd[0]`, call `sap_get_popup_window`
+3. Use the popup `classification` before acting; `input_required` and risky `confirmation` popups should usually stay human- or agent-reviewed
+4. Use `sap_handle_popup(action="auto")` only for clearly informational popups you want dismissed safely
+
+### Table Handling
+
+1. Start with `sap_read_table`
+2. Check `table_type`
+3. Use ALV-specific or TableControl-specific tools if needed
+
+### Form Fill
+
+1. Use `sap_set_batch_fields` for multi-field input instead of repeated single-field writes
+2. Add `skip_readonly=true` when the screen may include display-only fields
+3. Add `validate=true` when you want SAP to process the input with Enter and return post-validation screen feedback
+
+### SPRO Or Tree Navigation
+
+1. `sap_read_tree`
+2. `sap_search_tree_nodes`
+3. `sap_expand_tree_node` or `sap_click_tree_link`
+
+## Workflow Prompts
+
+In addition to tools, the server provides **MCP prompts** — step-by-step workflow
+guides that agents can invoke for common multi-tool SAP patterns. The
+`sap_get_workflow_guide` tool exposes the same guidance in tool form for agents
+that are better at discovering tools than prompts:
+
+| Prompt | Parameter | What it guides |
+|---|---|---|
+| `sap_search_help` | `field_id` | F4 value help by what opens: hit list, restriction dialog, date picker, time picker, or none; dropdowns take `sap_set_field` instead |
+| `sap_table_export` | `table_id` | Read all rows: schema discovery, column selection, pagination |
+| `sap_spro_navigate` | `activity_name` | SPRO customizing: open tree, search/expand, execute activity |
+
+Prompts cost zero tool count and reduce agent errors by prescribing the
+correct tool sequence for patterns that are easy to get wrong.
+
+## Related
+
+- [Client Setup Guide](CLIENTS.md)
+- [Overview](OVERVIEW.md)
