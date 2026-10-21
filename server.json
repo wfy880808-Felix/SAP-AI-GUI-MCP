@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.wfy880808-Felix/SAP-AI",
+  "name": "io.github.wfy880808-Felix/SAP-AI-GUI-Scripting",
   "description": "SAP GUI for Windows automation for AI agents - 64 structured tools via SAP GUI Scripting API",
   "repository": {
-    "url": "https://github.com/wfy880808-Felix/SAP-AI",
+    "url": "https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting",
     "source": "github"
   },
   "version": "0.6.0",
