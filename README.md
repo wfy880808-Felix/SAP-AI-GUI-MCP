@@ -21,14 +21,14 @@ It is client-agnostic: if your MCP client can launch a local `stdio` server, it 
 
 Current release: `0.6.0` for local Windows use over MCP `stdio`.
 
-[![CI](https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting/actions/workflows/ci.yml/badge.svg)](https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting/actions/workflows/ci.yml)
-[![Docs](https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting/actions/workflows/docs.yml/badge.svg)](https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting/actions/workflows/docs.yml)
-[![Release](https://img.shields.io/github/v/release/wfy880808-Felix/SAP-AI-GUI-Scripting)](https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting/releases)
+[![CI](https://github.com/wfy880808-Felix/SAP-AI-GUI-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/wfy880808-Felix/SAP-AI-GUI-MCP/actions/workflows/ci.yml)
+[![Docs](https://github.com/wfy880808-Felix/SAP-AI-GUI-MCP/actions/workflows/docs.yml/badge.svg)](https://github.com/wfy880808-Felix/SAP-AI-GUI-MCP/actions/workflows/docs.yml)
+[![Release](https://img.shields.io/github/v/release/wfy880808-Felix/SAP-AI-GUI-MCP)](https://github.com/wfy880808-Felix/SAP-AI-GUI-MCP/releases)
 
 ## Status
 
 - GitHub workflows are included for `CI`, `Docs`, `Dependency Audit`, and tag-based `Release`.
-- Primary repository: GitHub (`wfy880808-Felix/SAP-AI-GUI-Scripting`).
+- Primary repository: GitHub (`wfy880808-Felix/SAP-AI-GUI-MCP`).
 
 ## What's New
 
@@ -188,8 +188,8 @@ The `[screenshots]` extra adds screenshot optimization (reduces screenshot size 
 
 ```bash
 # Clone the repository
-git clone https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting.git
-cd SAP-AI-GUI-Scripting
+git clone https://github.com/wfy880808-Felix/SAP-AI-GUI-MCP.git
+cd SAP-AI-GUI-MCP
 
 # Install uv (if not already installed)
 pip install uv

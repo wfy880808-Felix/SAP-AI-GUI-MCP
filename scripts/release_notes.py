@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHANGELOG = ROOT / "CHANGELOG.md"
-DEFAULT_REPO = "wfy880808-Felix/SAP-AI-GUI-Scripting"
+DEFAULT_REPO = "wfy880808-Felix/SAP-AI-GUI-MCP"
 
 LINK_RE = re.compile(r"(?<!!)(\[[^\]]+\]\()([^)]+)(\))")
 

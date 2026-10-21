@@ -60,9 +60,9 @@ apps = [
 ]
 
 [project.urls]
-Repository = "https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting"
-Changelog = "https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting/blob/master/CHANGELOG.md"
-Issues = "https://github.com/wfy880808-Felix/SAP-AI-GUI-Scripting/issues"
+Repository = "https://github.com/wfy880808-Felix/SAP-AI-GUI-MCP"
+Changelog = "https://github.com/wfy880808-Felix/SAP-AI-GUI-MCP/blob/master/CHANGELOG.md"
+Issues = "https://github.com/wfy880808-Felix/SAP-AI-GUI-MCP/issues"
 
 [project.scripts]
 mcp-sap-gui = "mcp_sap_gui.server:main"
