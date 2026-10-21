@@ -2347,6 +2347,45 @@ async def sap_run_guixt_script(script: str, ctx: Context) -> dict:
     return await _com(lambda: c.run_guixt(script))
 
 
+@mcp.tool(annotations=_WRITE, tags=_TAGS_WRITE)
+async def sap_export_alv_spreadsheet(
+    ctx: Context,
+    grid_id: str = "wnd[0]/usr/cntlGRID1/shellcont/shell",
+    export_format: str = "xlsx",
+    save_to: str = "",
+    timeout: float = 25.0,
+) -> dict:
+    """Export the current ALV report with SAP's standard spreadsheet export.
+
+    Uses the report menu (List -> Export -> Spreadsheet...), so it works even
+    when the grid hides its toolbar buttons. The SAP export dialog is driven
+    directly: the requested format is selected (xlsx default) and confirmed,
+    then the front-end "download" status message is awaited. SAP writes the
+    file to its front-end temp directory (usually C:\\TEMP\\EXPORT.<ext>);
+    the returned file_path tells you where.
+
+    Parameters:
+        grid_id: ALV grid id (informational; the export is driven via menu).
+        export_format: xlsx (default) | xls | html | ods | tsv | xml.
+        save_to: optional target — a full file path to copy the export to,
+            or a directory (SAP's file name is kept). Parent dirs are created.
+        timeout: seconds to wait for the download status message (default 25).
+
+    Returns:
+        status (exported/requested), message, file_path, saved_to (if any).
+
+    Note: if SAP Logon shows the client security prompt "A script is trying
+    to access SAP GUI", tick SAP GUI Options -> Accessibility & Scripting ->
+    "Enable scripting" so the prompt stops appearing on every session.
+    """
+    _check_write(ctx)
+    c = _ctrl(ctx)
+    return await _com(lambda: c.export_alv_spreadsheet(
+        grid_id=grid_id, export_format=export_format,
+        save_to=save_to, timeout=timeout,
+    ))
+
+
 # ===========================================================================
 # Policy profile tools
 # ===========================================================================

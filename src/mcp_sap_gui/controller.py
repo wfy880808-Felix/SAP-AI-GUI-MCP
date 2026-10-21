@@ -516,6 +516,194 @@ class SAPGUIControllerBase:
         )
         return {"status": "submitted", "script": script, "window_hwnd": hwnd}
 
+    # ------------------------------------------------------------------
+    # ALV standard spreadsheet export (List -> Export -> Spreadsheet...).
+    # ------------------------------------------------------------------
+    def export_alv_spreadsheet(self, grid_id: str = "wnd[0]/usr/cntlGRID1/shellcont/shell",
+                               export_format: str = "xlsx",
+                               save_to: str = "",
+                               timeout: float = 25.0) -> dict:
+        """Export the current ALV grid with SAP's standard spreadsheet export.
+
+        Uses the report menu (List -> Export -> Spreadsheet...) so it works
+        even when the grid hides its toolbar buttons. Selects the requested
+        format in SAP's export dialog, confirms, waits for the front-end
+        "download" status message, and reports the file SAP wrote (usually
+        C:\\TEMP\\EXPORT.<ext>). When *save_to* is set the file is copied
+        there (a full file path, or a directory to keep SAP's file name).
+        """
+        self._require_session()
+        import re as _re
+        import time as _time
+        import shutil
+        from pathlib import Path
+
+        fmt_map = {
+            "xlsx": ("xlsx", "office open xml", "31"),
+            "xls": ("excel 97", "xls", "excel"),
+            "html": ("html",),
+            "ods": ("opendocument", "ods"),
+            "tsv": ("tsv", "制表符", "tab"),
+            "xml": ("xml",),
+        }
+        fmt = export_format.lower()
+        if fmt not in fmt_map:
+            raise SAPGUIError(f"Unsupported export format {export_format!r}; use xlsx, xls, html, ods, tsv, xml")
+
+        # 1) find List -> Export -> Spreadsheet... in the menu bar.
+        menu_id = self._find_export_menu()
+        if menu_id is None:
+            menu_id = "wnd[0]/mbar/menu[0]/menu[1]/menu[1]"  # standard ALV layout
+        sel = self.select_menu(menu_id)
+        if isinstance(sel, dict) and (sel.get("status") != "selected"):
+            return sel
+
+        # 2) wait for the export dialog (wnd[1]).
+        dialog = None
+        for _ in range(40):
+            _time.sleep(0.25)
+            try:
+                dialog = self._session.findById("wnd[1]")
+                break
+            except Exception:
+                dialog = None
+        if dialog is None:
+            return self._error_result(
+                {"menu_id": menu_id, "export_format": fmt},
+                None,
+                "Export dialog (wnd[1]) did not appear",
+            )
+
+        # 3) "choose from all available formats" so the combo is editable.
+        try:
+            rb = self._session.findById("wnd[1]/usr/radRB_OTHERS")
+            if rb is not None and not rb.Selected:
+                rb.Select()
+                _time.sleep(0.3)
+        except Exception:
+            pass
+
+        # 4) pick the format entry in the combo by text, else known key.
+        combo_id = "wnd[1]/usr/cmbG_LISTBOX"
+        try:
+            combo = self._session.findById(combo_id)
+        except Exception:
+            combo = None
+        if combo is not None:
+            chosen = None
+            try:
+                entries = self.get_combobox_entries(combo_id)
+                for it in entries.get("entries", []):
+                    text = str(it.get("value", "") or "")
+                    key = str(it.get("key", "") or "")
+                    if any(k.lower() in text.lower() for k in fmt_map[fmt]):
+                        chosen = key or text
+                        break
+            except Exception:
+                chosen = None
+            if chosen is None and len(fmt_map[fmt]) > 2:
+                chosen = fmt_map[fmt][2]  # known-good key for xlsx (31)
+            if chosen:
+                try:
+                    self.set_field(combo_id, chosen)
+                except Exception:
+                    pass
+
+        # 5) confirm: first enabled button on the dialog toolbar.
+        pressed = None
+        for bid in ("wnd[1]/tbar[0]/btn[0]", "wnd[1]/tbar[0]/btn[1]"):
+            try:
+                b = self._session.findById(bid)
+                if b is not None and getattr(b, "Enabled", True):
+                    self.press_button(bid)
+                    pressed = bid
+                    break
+            except Exception:
+                continue
+        if pressed is None:
+            return self._error_result(
+                {"menu_id": menu_id, "export_format": fmt},
+                None,
+                "No enabled confirm button found on the export dialog",
+            )
+
+        # 6) wait for the "download" status message and extract the file path.
+        deadline = _time.time() + timeout
+        msg = ""
+        path_hit = None
+        while _time.time() < deadline:
+            _time.sleep(0.5)
+            try:
+                msg = str(self.get_screen_info().get("message", "") or "")
+            except Exception:
+                msg = ""
+            m = _re.search(r"[A-Za-z]:\\[^\s\"']+?\.\w{2,5}", msg)
+            if m:
+                path_hit = m.group(0)
+                break
+            if any(k in msg for k in ("下载", "Download", "Export", "导出")):
+                m2 = _re.search(r"[A-Za-z]:\\[^\s\"']+", msg)
+                if m2:
+                    path_hit = m2.group(0)
+                    break
+
+        result = {
+            "status": "exported" if path_hit else "requested",
+            "message": msg,
+            "export_format": fmt,
+            "grid_id": grid_id,
+        }
+        if path_hit:
+            result["file_path"] = path_hit
+            if save_to:
+                try:
+                    src = Path(path_hit)
+                    dst = Path(save_to)
+                    if dst.suffix.lower() not in (".xlsx", ".xls", ".html", ".xml", ".tsv", ".ods", ".csv"):
+                        dst = dst / src.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(src), str(dst))
+                    result["saved_to"] = str(dst)
+                except Exception as e:
+                    result["copy_error"] = str(e)
+        return result
+
+    def _find_export_menu(self):
+        """Return the menu id of List -> Export -> Spreadsheet... or None."""
+        try:
+            elements, _lists = [], []
+            found = self.get_screen_elements(
+                "wnd[0]/mbar", max_depth=3, type_filter="",
+                changeable_only=False, expand_tables=False, lists=_lists)
+        except Exception:
+            return None
+        if not found:
+            return None
+        list_menu = None
+        for e in found:
+            if e.id.count("/") == 2:
+                txt = (getattr(e, "text", "") or "").strip()
+                if txt in ("列表", "List", "Liste") or txt.startswith("列表"):
+                    list_menu = e
+                    break
+        if list_menu is None:
+            return None
+        export_menu = None
+        for e in found:
+            if e.id.startswith(list_menu.id + "/") and e.id.count("/") == 3:
+                txt = (getattr(e, "text", "") or "").strip()
+                if txt in ("导出", "Export", "Exporteren"):
+                    export_menu = e
+                    break
+        if export_menu is None:
+            return None
+        for e in found:
+            if e.id.startswith(export_menu.id + "/") and e.id.count("/") == 4:
+                txt = (getattr(e, "text", "") or "").strip()
+                if txt in ("电子表格...", "电子表格", "Spreadsheet...", "Spreadsheet"):
+                    return e.id
+        return None
+
     def _object_tree(self, root_id: str, props: List[str], *,
                      site: str) -> Optional[Dict[str, Any]]:
         """An element and all its descendants in ONE call, or None.
