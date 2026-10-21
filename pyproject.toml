@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-sap-gui"
-version = "0.5.2"
+version = "0.6.0"
 description = "MCP Server for SAP GUI Scripting automation"
 readme = "README.md"
 license = "MIT"
@@ -36,6 +36,8 @@ dependencies = [
     "fastmcp>=3.4.7,<3.5",
     "pywin32>=306; platform_system == 'Windows'",
     "python-dotenv>=1.0",
+    # Physical-pixel mouse input for controls without a COM element.
+    "pyautogui>=0.9.54; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
@@ -58,9 +60,9 @@ apps = [
 ]
 
 [project.urls]
-Repository = "https://github.com/kts982/mcp-sap-gui"
-Changelog = "https://github.com/kts982/mcp-sap-gui/blob/master/CHANGELOG.md"
-Issues = "https://github.com/kts982/mcp-sap-gui/issues"
+Repository = "https://github.com/wfy880808-Felix/SAP-AI"
+Changelog = "https://github.com/wfy880808-Felix/SAP-AI/blob/master/CHANGELOG.md"
+Issues = "https://github.com/wfy880808-Felix/SAP-AI/issues"
 
 [project.scripts]
 mcp-sap-gui = "mcp_sap_gui.server:main"

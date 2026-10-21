@@ -418,6 +418,104 @@ class SAPGUIControllerBase:
         normalized = self._validate_element_id(element_id)
         return self._session.findById(normalized)
 
+    # ------------------------------------------------------------------
+    # Physical-pixel mouse input and GuiXT InputScript submission.
+    # ------------------------------------------------------------------
+    def window_handle(self, main: bool = False) -> int:
+        """HWND of the current session window (main = wnd[0], else the active window).
+
+        The DPI awareness context matches MSS physical pixels on each monitor.
+        """
+        self._require_session()
+        import ctypes
+
+        import win32gui
+
+        ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        window = self._session.findById("wnd[0]") if main else self._session.ActiveWindow
+        hwnd = int(window.Handle)
+        if not win32gui.IsWindow(hwnd):
+            raise SAPGUIError("The configured SAP session window no longer exists")
+        return hwnd
+
+    def pixel_action(self, action: str, x: int = 0, y: int = 0,
+                     text: str = "", direction: str = "down") -> dict:
+        """Send physical input to the SAP window via pyautogui.
+
+        action: click | move | type | scroll
+        x/y: physical screenshot pixels relative to the SAP window.
+        """
+        self._require_session()
+        import pyautogui
+
+        import win32gui
+
+        hwnd = self.window_handle()
+        win32gui.SetForegroundWindow(hwnd)
+        if win32gui.GetForegroundWindow() != hwnd:
+            raise SAPGUIError("Could not focus the configured SAP window; no input was sent")
+        if action in {"click", "move"}:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            if not 0 <= x < right - left or not 0 <= y < bottom - top:
+                raise SAPGUIError("Coordinates are outside the configured SAP window")
+            pyautogui.moveTo(left + x, top + y)
+            if win32gui.GetForegroundWindow() != hwnd:
+                raise SAPGUIError("SAP focus changed before input")
+            if action == "click":
+                pyautogui.click()
+        elif action == "type":
+            import win32com.client
+
+            win32com.client.Dispatch("WScript.Shell").SendKeys(text)
+        elif action == "scroll":
+            pyautogui.scroll(5 if direction == "up" else -5)
+        else:
+            raise SAPGUIError("Unsupported pixel action")
+        return {"status": "input-sent"}
+
+    def run_guixt(self, script: str) -> dict:
+        """Submit a preinstalled GuiXT InputScript to the exact SAP window (async completion).
+
+        Requires GUIXT_PATH (absolute guixt.exe) and GUIXT_SCRIPT_ROOT (directory
+        containing reviewed InputScripts). The script must be a simple
+        ``name.txt`` file inside the root; no shell fragments are used.
+        """
+        self._require_session()
+        import os
+        import re
+        import subprocess
+        from pathlib import Path
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]+\.txt", script):
+            raise SAPGUIError("Use a preinstalled simple .txt script name from GUIXT_SCRIPT_ROOT")
+        root_raw = os.environ.get("GUIXT_SCRIPT_ROOT", "")
+        if not root_raw:
+            raise SAPGUIError("Configure GUIXT_SCRIPT_ROOT as an existing directory with reviewed InputScripts")
+        root = Path(root_raw).resolve()
+        path = (root / script).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            raise SAPGUIError("GuiXT script must stay inside GUIXT_SCRIPT_ROOT")
+        if not path.is_file():
+            raise SAPGUIError("GuiXT script must be a preinstalled file")
+        if any(ch in str(path) for ch in ';,"\r\n'):
+            raise SAPGUIError("GuiXT script path contains a reserved separator")
+        guixt = os.environ.get("GUIXT_PATH", "")
+        exe = Path(guixt)
+        if not exe.is_absolute() or exe.name.lower() != "guixt.exe" or not exe.is_file():
+            raise SAPGUIError("Configure GUIXT_PATH as the absolute installed guixt.exe path")
+        hwnd = self.window_handle(main=True)
+        subprocess.run(
+            [str(exe), f"findsession=hwnd:'{hwnd}'", f"input=OK:process={path}"],
+            timeout=10,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return {"status": "submitted", "script": script, "window_hwnd": hwnd}
+
     def _object_tree(self, root_id: str, props: List[str], *,
                      site: str) -> Optional[Dict[str, Any]]:
         """An element and all its descendants in ONE call, or None.

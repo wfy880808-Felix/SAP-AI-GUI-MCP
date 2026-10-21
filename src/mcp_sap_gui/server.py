@@ -2301,6 +2301,53 @@ async def sap_preview(
 
 
 # ===========================================================================
+# Physical-pixel mouse input and GuiXT InputScript submission.
+# ===========================================================================
+
+@mcp.tool(annotations=_WRITE, tags=_TAGS_WRITE)
+async def sap_click(x: int, y: int, ctx: Context) -> dict:
+    """Click physical screenshot pixels relative to the current SAP window.
+
+    Coordinates are pixels from a screenshot of the same window (e.g.
+    sap_take_screenshot). Useful when a control has no usable COM element."""
+    _check_write(ctx)
+    c = _ctrl(ctx)
+    return await _com(lambda: c.pixel_action("click", x=x, y=y))
+
+
+@mcp.tool(annotations=_WRITE, tags=_TAGS_WRITE)
+async def sap_move_mouse(x: int, y: int, ctx: Context) -> dict:
+    """Move the physical mouse to screenshot pixels relative to the current SAP window."""
+    _check_write(ctx)
+    c = _ctrl(ctx)
+    return await _com(lambda: c.pixel_action("move", x=x, y=y))
+
+
+@mcp.tool(annotations=_WRITE, tags=_TAGS_WRITE)
+async def sap_type(text: str, ctx: Context) -> dict:
+    """Type WScript SendKeys text/special keys into the focused SAP window.
+
+    Use sap_set_field for literal field text; sap_type is for keyboard-level
+    input such as special keys."""
+    _check_write(ctx)
+    c = _ctrl(ctx)
+    return await _com(lambda: c.pixel_action("type", text=text))
+
+
+@mcp.tool(annotations=_WRITE, tags=_TAGS_WRITE)
+async def sap_run_guixt_script(script: str, ctx: Context) -> dict:
+    """Submit a preinstalled GuiXT InputScript (a simple name.txt under
+    GUIXT_SCRIPT_ROOT) to the exact SAP window.
+
+    Requires GUIXT_PATH (absolute guixt.exe) and GUIXT_SCRIPT_ROOT in the
+    environment. Completion is asynchronous: inspect the session after
+    submission."""
+    _check_write(ctx)
+    c = _ctrl(ctx)
+    return await _com(lambda: c.run_guixt(script))
+
+
+# ===========================================================================
 # Policy profile tools
 # ===========================================================================
 

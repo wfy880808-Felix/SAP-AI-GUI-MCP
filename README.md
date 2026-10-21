@@ -1,21 +1,34 @@
 # MCP SAP GUI Server
 
-<!-- mcp-name: io.github.kts982/mcp-sap-gui -->
+> ## Extended distribution (`0.6.0`)
+>
+> This distribution ships 64 tools: the full SAP GUI automation suite
+> plus four additional low-level utilities:
+>
+> - `sap_click(x, y)` — physical-pixel mouse click (pyautogui)
+> - `sap_move_mouse(x, y)` — physical mouse move (pyautogui)
+> - `sap_type(text)` — keyboard input via WScript Shell SendKeys
+> - `sap_run_guixt_script(script)` — submit a GuiXT InputScript
+>   (requires env `GUIXT_PATH` / `GUIXT_SCRIPT_ROOT`)
+>
+> All of them go through the same write gate (`--read-only`,
+> confirmation points, transaction policy). Version was bumped to
+> `0.6.0` for this distribution.
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that enables AI assistants to interact with SAP GUI for Windows through the SAP GUI Scripting API.
 
 It is client-agnostic: if your MCP client can launch a local `stdio` server, it can use this project. Examples in this README use Claude because the setup is easy to demonstrate, but the same server can be used from Codex, GitHub Copilot, Gemini CLI, and similar MCP-capable tools.
 
-Current release: `0.5.2` for local Windows use over MCP `stdio`.
+Current release: `0.6.0` for local Windows use over MCP `stdio`.
 
-[![CI](https://github.com/kts982/mcp-sap-gui/actions/workflows/ci.yml/badge.svg)](https://github.com/kts982/mcp-sap-gui/actions/workflows/ci.yml)
-[![Docs](https://github.com/kts982/mcp-sap-gui/actions/workflows/docs.yml/badge.svg)](https://github.com/kts982/mcp-sap-gui/actions/workflows/docs.yml)
-[![Release](https://img.shields.io/github/v/release/kts982/mcp-sap-gui)](https://github.com/kts982/mcp-sap-gui/releases)
+[![CI](https://github.com/wfy880808-Felix/SAP-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/wfy880808-Felix/SAP-AI/actions/workflows/ci.yml)
+[![Docs](https://github.com/wfy880808-Felix/SAP-AI/actions/workflows/docs.yml/badge.svg)](https://github.com/wfy880808-Felix/SAP-AI/actions/workflows/docs.yml)
+[![Release](https://img.shields.io/github/v/release/wfy880808-Felix/SAP-AI)](https://github.com/wfy880808-Felix/SAP-AI/releases)
 
 ## Status
 
 - GitHub workflows are included for `CI`, `Docs`, `Dependency Audit`, and tag-based `Release`.
-- Primary repository: GitHub (`kts982/mcp-sap-gui`).
+- Primary repository: GitHub (`wfy880808-Felix/SAP-AI`).
 
 ## What's New
 
@@ -175,8 +188,8 @@ The `[screenshots]` extra adds screenshot optimization (reduces screenshot size 
 
 ```bash
 # Clone the repository
-git clone https://github.com/kts982/mcp-sap-gui.git
-cd mcp-sap-gui
+git clone https://github.com/wfy880808-Felix/SAP-AI.git
+cd SAP-AI
 
 # Install uv (if not already installed)
 pip install uv
